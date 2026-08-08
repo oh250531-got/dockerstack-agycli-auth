@@ -2,6 +2,28 @@
 
 ---
 
+## [2.2.0] — 2026-08-08 — Verify account directly from AGY Auth UI
+
+### What's New
+
+**OAuth no longer stops at “token file created”.** After the Google authorization
+code is submitted, the app waits for AGY's own eligibility result.
+
+- If the account is already eligible, the UI shows **Verified** and then saves the token.
+- If AGY requires extra account verification, the UI shows **Verification URL #2**.
+  Open it, complete Google verification, then click **I verified — Check Again**.
+- Re-check uses the OAuth credential you just created; you do **not** repeat the first
+  Google OAuth code flow.
+- Network/location/backend errors are shown separately instead of being mistaken for
+  an unverified account.
+- A verification URL may be temporary, so open it promptly; if it expires, use
+  **Check Again** to let AGY issue a fresh result/URL.
+
+The feature follows AGY/Google's official eligibility flow; it does not bypass
+account, region, age, subscription, or other eligibility controls.
+
+---
+
 ## [2.0.0] — 2026-04-09 — Modular Stack Template
 
 ### What's New

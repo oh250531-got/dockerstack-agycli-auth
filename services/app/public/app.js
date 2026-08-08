@@ -11,6 +11,9 @@ const state = {
   sessionId: null,
   email: null,
   authUrl: null,
+  verifyUrl: null,
+  eligibilityStatus: "unknown",
+  stage: "idle",
   sse: null,
   screen: 1, // 1 = start, 2 = authorize, 3 = success, 0 = error
   reconnects: 0,
@@ -42,9 +45,21 @@ const dom = {
   authBadge: $("auth-badge"),
   sessionBadge: $("session-badge"),
   spinnerCode: $("spinner-code"),
+  spinnerCodeText: $("spinner-code-text"),
+  oauthFlowPanel: $("oauth-flow-panel"),
+  verifyPanel: $("verify-panel"),
+  verifyUrlContainer: $("verify-url-container"),
+  verifyUrlLink: $("verify-url-link"),
+  spinnerVerify: $("spinner-verify"),
+  eligibilityMessage: $("eligibility-message"),
+  eligibilityTitle: $("eligibility-title"),
+  eligibilityDescription: $("eligibility-description"),
 
   btnStart: $("btn-start"),
   btnOpenUrl: $("btn-open-url"),
+  btnOpenVerifyUrl: $("btn-open-verify-url"),
+  btnCheckVerification: $("btn-check-verification"),
+  checkVerificationLabel: $("check-verification-label"),
   btnSubmitCode: $("btn-submit-code"),
   btnPasteConfirm: $("btn-paste-confirm"),
   btnLoginAnother: $("btn-login-another"),
@@ -383,6 +398,12 @@ function handleSSE(data) {
     case "auth_url":
       onAuthUrl(data.url);
       break;
+    case "verify_url":
+      onVerifyUrl(data.url);
+      break;
+    case "eligibility_result":
+      onEligibilityResult(data);
+      break;
     case "token_saved":
       onTokenSaved(data);
       break;
@@ -402,16 +423,43 @@ function handleSSE(data) {
 }
 
 function onStatus(stage, data) {
+  state.stage = stage || state.stage;
   const labels = {
     starting: "Starting…",
     waiting_url: "Waiting for auth URL…",
     url_ready: "Auth URL ready",
     waiting_code: "Waiting for code",
-    success: "Token saved!",
+    credential_wait: "OAuth complete — checking credential…",
+    checking_eligibility: "Checking AGY eligibility…",
+    verification_required: "Verification required",
+    checking_verification: "Re-checking verification…",
+    verified: "Account verified",
+    eligibility_error: "Eligibility check error",
+    eligibility_unknown: "Eligibility result unknown",
+    success: "Verified & token saved!",
     error: "Error",
   };
-  setBadge(dom.sessionBadge, labels[stage] || stage, stage === "success" ? "success" : stage === "error" ? "danger" : "info");
+  const variant = stage === "success" || stage === "verified"
+    ? "success"
+    : stage === "error" || stage === "eligibility_error"
+      ? "danger"
+      : stage === "verification_required" || stage === "eligibility_unknown"
+        ? "warning"
+        : "info";
+  setBadge(dom.sessionBadge, labels[stage] || stage, variant);
   setSidebarStatus(labels[stage] || stage);
+
+  if (stage === "verification_required" && data && data.verifyUrl) {
+    onVerifyUrl(data.verifyUrl);
+    return;
+  }
+
+  if (stage === "checking_eligibility") {
+    showScreen(2);
+    dom.spinnerCode.classList.remove("hidden");
+    if (dom.spinnerCodeText) dom.spinnerCodeText.textContent = "OAuth complete. Waiting for AGY eligibility result…";
+    setBadge(dom.authBadge, "Checking eligibility…", "info");
+  }
 }
 
 function onAuthUrl(url) {
@@ -424,6 +472,82 @@ function onAuthUrl(url) {
   setSidebarStatus("Auth URL ready");
 }
 
+function showVerificationPanel({ hasUrl = !!state.verifyUrl } = {}) {
+  showScreen(2);
+  dom.oauthFlowPanel.classList.add("hidden");
+  dom.verifyPanel.classList.remove("hidden");
+  dom.spinnerCode.classList.add("hidden");
+  dom.verifyUrlContainer.classList.toggle("hidden", !hasUrl);
+  dom.btnOpenVerifyUrl.classList.toggle("hidden", !hasUrl);
+}
+
+function onVerifyUrl(url) {
+  if (!url) return;
+  state.verifyUrl = url;
+  state.eligibilityStatus = "verification_required";
+  showVerificationPanel();
+  dom.verifyUrlLink.href = url;
+  dom.verifyUrlLink.textContent = url;
+  dom.spinnerVerify.classList.add("hidden");
+  dom.btnCheckVerification.disabled = false;
+  dom.checkVerificationLabel.textContent = "I verified — Check Again";
+  dom.eligibilityTitle.textContent = "AGY requires account verification.";
+  dom.eligibilityDescription.textContent = "This is the official verification URL printed by AGY. Open it now, complete Google verification, then return here and check again.";
+  setBadge(dom.authBadge, "Verification required", "warning");
+  dom.eligibilityMessage.textContent = "Complete Google verification using URL #2, then click ‘I verified — Check Again’.";
+  toast("AGY requires account verification — URL #2 is ready", "warning");
+  setSidebarStatus("Verification required");
+}
+
+function onEligibilityResult(data) {
+  const outcome = data.outcome || "unknown";
+  state.eligibilityStatus = outcome;
+
+  if (outcome === "checking") {
+    const isRecheck = state.stage === "checking_verification" || state.verifyUrl || !dom.verifyPanel.classList.contains("hidden");
+    showScreen(2);
+    if (isRecheck) {
+      showVerificationPanel({ hasUrl: !!state.verifyUrl });
+      dom.spinnerVerify.classList.remove("hidden");
+      dom.btnCheckVerification.disabled = true;
+      dom.eligibilityMessage.textContent = "Checking the existing OAuth credential with AGY…";
+    } else {
+      dom.spinnerCode.classList.remove("hidden");
+      if (dom.spinnerCodeText) dom.spinnerCodeText.textContent = "OAuth complete. Waiting for AGY eligibility result…";
+    }
+    setBadge(dom.authBadge, "Checking eligibility…", "info");
+    return;
+  }
+
+  if (outcome === "verified") {
+    showScreen(2);
+    dom.spinnerCode.classList.remove("hidden");
+    dom.spinnerVerify.classList.add("hidden");
+    dom.btnCheckVerification.disabled = true;
+    setBadge(dom.authBadge, "Verified", "success");
+    if (dom.spinnerCodeText) dom.spinnerCodeText.textContent = "Account verified. Saving credential…";
+    if (state.verifyUrl) dom.eligibilityMessage.textContent = "AGY verification passed. Saving token…";
+    toast("AGY confirms the account is verified", "success");
+    return;
+  }
+
+  if (outcome === "error" || outcome === "unknown") {
+    showVerificationPanel({ hasUrl: !!state.verifyUrl });
+    dom.spinnerVerify.classList.add("hidden");
+    dom.btnCheckVerification.disabled = data.retryable === false;
+    dom.checkVerificationLabel.textContent = state.verifyUrl ? "I verified — Check Again" : "Check Again";
+    const message = data.message || (outcome === "unknown" ? "AGY did not return a conclusive eligibility result." : "Eligibility check failed.");
+    dom.eligibilityTitle.textContent = outcome === "unknown" ? "Eligibility result is not conclusive." : "AGY eligibility check error.";
+    dom.eligibilityDescription.textContent = state.verifyUrl
+      ? "The last official verification URL remains available above."
+      : "No verification URL was produced for this result. This can be a network, backend, credential, or location error rather than an account-verification requirement.";
+    dom.eligibilityMessage.textContent = message + (data.retryable === false ? "" : " You can retry Check Again.");
+    setBadge(dom.authBadge, outcome === "unknown" ? "Eligibility unknown" : "Eligibility error", outcome === "unknown" ? "warning" : "danger");
+    toast(message, outcome === "unknown" ? "warning" : "danger");
+    setSidebarStatus(outcome === "unknown" ? "Eligibility unknown" : "Eligibility check error");
+  }
+}
+
 function onTokenSaved(data) {
   showScreen(3);
   dom.successEmail.textContent = data.email || state.email || "—";
@@ -432,9 +556,10 @@ function onTokenSaved(data) {
   dom.btnSubmitCode.disabled = false;
   dom.btnPasteConfirm.disabled = false;
   dom.spinnerCode.classList.add("hidden");
+  dom.spinnerVerify.classList.add("hidden");
   if (data.snapshot) renderLoginSnapshot(data.snapshot);
-  toast("Token saved successfully!", "success");
-  setSidebarStatus("Token saved!");
+  toast("Account verified and token saved successfully!", "success");
+  setSidebarStatus("Verified & token saved!");
 }
 
 function showError(message) {
@@ -525,12 +650,43 @@ async function apiSubmitCode() {
       return;
     }
 
-    toast("Code submitted, waiting for token…", "info");
+    toast("Code submitted. Waiting for AGY eligibility check…", "info");
   } catch (err) {
     showError("Network error: " + err.message);
     dom.btnSubmitCode.disabled = false;
     dom.btnPasteConfirm.disabled = false;
     dom.spinnerCode.classList.add("hidden");
+  }
+}
+
+async function apiCheckVerification() {
+  if (!state.sessionId) return;
+  dom.btnCheckVerification.disabled = true;
+  dom.spinnerVerify.classList.remove("hidden");
+  setBadge(dom.authBadge, "Re-checking…", "info");
+  dom.eligibilityMessage.textContent = "Re-checking your existing OAuth credential with AGY…";
+
+  try {
+    const res = await fetch("/api/login/verify-check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.sessionId }),
+    });
+    const json = await res.json();
+    if (!res.ok || !json.success) {
+      dom.btnCheckVerification.disabled = false;
+      dom.spinnerVerify.classList.add("hidden");
+      const message = json.error || `HTTP ${res.status}`;
+      dom.eligibilityMessage.textContent = message;
+      toast(message, "danger");
+      return;
+    }
+    toast("Verification re-check started", "info");
+  } catch (err) {
+    dom.btnCheckVerification.disabled = false;
+    dom.spinnerVerify.classList.add("hidden");
+    dom.eligibilityMessage.textContent = "Network error: " + err.message;
+    toast("Network error: " + err.message, "danger");
   }
 }
 
@@ -562,6 +718,9 @@ function resetUI(options = {}) {
   const currentEmail = dom.inputEmail.value;
   state.sessionId = null;
   state.authUrl = null;
+  state.verifyUrl = null;
+  state.eligibilityStatus = "unknown";
+  state.stage = "idle";
   state.reconnects = 0;
   dom.inputEmail.value = keepEmail ? currentEmail : "";
   dom.inputCode.value = "";
@@ -569,6 +728,19 @@ function resetUI(options = {}) {
   dom.btnSubmitCode.disabled = false;
   dom.btnPasteConfirm.disabled = false;
   dom.spinnerCode.classList.add("hidden");
+  dom.spinnerVerify.classList.add("hidden");
+  dom.oauthFlowPanel.classList.remove("hidden");
+  dom.verifyPanel.classList.add("hidden");
+  dom.verifyUrlContainer.classList.remove("hidden");
+  dom.btnOpenVerifyUrl.classList.remove("hidden");
+  dom.verifyUrlLink.href = "#";
+  dom.verifyUrlLink.textContent = "—";
+  dom.btnCheckVerification.disabled = false;
+  dom.checkVerificationLabel.textContent = "I verified — Check Again";
+  dom.eligibilityTitle.textContent = "AGY requires account verification.";
+  dom.eligibilityDescription.textContent = "This is the official verification URL printed by AGY. Open it now, complete Google verification, then return here and check again.";
+  dom.eligibilityMessage.textContent = "Token is not saved until AGY confirms the account no longer requires verification.";
+  if (dom.spinnerCodeText) dom.spinnerCodeText.textContent = "Waiting for credential and AGY eligibility check…";
   dom.errorEmail.classList.add("hidden");
   dom.errorCode.classList.add("hidden");
   dom.inputEmail.classList.remove("error");
@@ -760,6 +932,10 @@ dom.btnPasteConfirm.addEventListener("click", async () => {
 dom.btnOpenUrl.addEventListener("click", () => {
   if (state.authUrl) window.open(state.authUrl, "_blank", "noopener");
 });
+dom.btnOpenVerifyUrl.addEventListener("click", () => {
+  if (state.verifyUrl) window.open(state.verifyUrl, "_blank", "noopener");
+});
+dom.btnCheckVerification.addEventListener("click", apiCheckVerification);
 dom.btnLoginAnother.addEventListener("click", resetUI);
 dom.btnTryAgain.addEventListener("click", () => {
   apiResetSession();

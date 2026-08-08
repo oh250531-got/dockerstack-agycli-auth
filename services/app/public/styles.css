@@ -1133,3 +1133,9 @@ td.primary-col { color: var(--primary); font-weight: 500; }
   text-decoration: underline;
 }
 
+
+/* AGY verification URL #2 flow */
+.verification-actions { flex-wrap: wrap; }
+.verification-actions > button { flex: 1 1 220px; justify-content: center; }
+#verify-panel .auth-url-box { border-color: var(--warning, #d97706); }
+#eligibility-message { line-height: 1.5; }

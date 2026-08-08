@@ -9,11 +9,12 @@
  *     sessionId, email, fifoPath, childProcess, sseRes,
  *     status: 'starting' | 'waiting_url' | 'url_ready' | 'waiting_code' | 'success' | 'error',
  *     authUrl, createdAt, cleanupTimer,
- *     stdoutBuf, stderrBuf, loginLogs, loginSnapshot,
+ *     stdoutBuf, stderrBuf, loginLogs, loginSnapshot, verifyUrl, eligibilityStatus,
  *   }
  */
 
 const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS || '600000', 10);
+const VERIFICATION_SESSION_TIMEOUT_MS = parseInt(process.env.VERIFICATION_SESSION_TIMEOUT_MS || '1200000', 10);
 
 const sessions = new Map();
 
@@ -24,7 +25,34 @@ const log = {
   ok:   (msg) => console.log(`✓  [SESSION] ${msg}`),
 };
 
-function createSession({ sessionId, email }) {
+function armCleanupTimer(session, timeoutMs) {
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  session.timeoutMs = timeoutMs;
+  session.cleanupTimer = setTimeout(async () => {
+    const current = sessions.get(session.sessionId);
+    if (!current) return;
+    log.warn(`Session ${session.sessionId} timed out after ${timeoutMs}ms; destroying.`);
+    if (typeof current.onTimeout === 'function') {
+      try {
+        await current.onTimeout(current);
+      } catch (err) {
+        log.err(`Timeout cleanup failed for ${session.sessionId}: ${err.message}`);
+      }
+    }
+    if (sessions.has(session.sessionId)) {
+      destroySession(session.sessionId, { reason: 'timeout' });
+    }
+  }, timeoutMs);
+}
+
+function refreshSessionTimeout(sessionId, timeoutMs = SESSION_TIMEOUT_MS) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  armCleanupTimer(session, timeoutMs);
+  return true;
+}
+
+function createSession({ sessionId, email, onTimeout = null }) {
   if (sessions.has(sessionId)) {
     throw new Error(`Session ${sessionId} already exists`);
   }
@@ -37,20 +65,26 @@ function createSession({ sessionId, email }) {
     sseRes: null,
     status: 'starting',
     authUrl: null,
+    verifyUrl: null,
+    eligibilityStatus: 'unknown',
+    eligibilityReason: null,
+    credentialReady: false,
+    beforeSnapshot: null,
+    finalizing: false,
     createdAt: Date.now(),
     cleanupTimer: null,
+    timeoutMs: SESSION_TIMEOUT_MS,
+    onTimeout,
     stdoutBuf: '',
     stderrBuf: '',
     loginLogs: [],
     loginSnapshot: null,
+    lastTokenSaved: null,
   };
-  // Auto-cleanup after timeout
-  session.cleanupTimer = setTimeout(() => {
-    log.warn(`Session ${sessionId} timed out after ${SESSION_TIMEOUT_MS}ms; destroying.`);
-    destroySession(sessionId, { reason: 'timeout' });
-  }, SESSION_TIMEOUT_MS);
-
   sessions.set(sessionId, session);
+  // Auto-cleanup after timeout. The route may provide an onTimeout callback to
+  // release external resources (Docker mutex, FIFO, credential) before destroy.
+  armCleanupTimer(session, SESSION_TIMEOUT_MS);
   log.ok(`Created session ${sessionId} for ${email}`);
   return session;
 }
@@ -120,6 +154,12 @@ function attachSSE(sessionId, res) {
   if (s.authUrl) {
     emitSSE(sessionId, { type: 'auth_url', url: s.authUrl });
   }
+  if (s.verifyUrl) {
+    emitSSE(sessionId, { type: 'verify_url', url: s.verifyUrl });
+  }
+  if (s.lastTokenSaved) {
+    emitSSE(sessionId, s.lastTokenSaved);
+  }
   for (const event of s.loginLogs) {
     emitSSE(sessionId, event);
   }
@@ -163,7 +203,9 @@ function listSessions() {
 
 module.exports = {
   SESSION_TIMEOUT_MS,
+  VERIFICATION_SESSION_TIMEOUT_MS,
   createSession,
+  refreshSessionTimeout,
   getSession,
   updateStatus,
   appendLog,

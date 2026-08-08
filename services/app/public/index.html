@@ -124,6 +124,7 @@
               <span class="badge badge-warning" id="auth-badge">Waiting for code</span>
             </div>
             <div class="card-body">
+              <div id="oauth-flow-panel">
               <div class="alert alert-info mb-6">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="12" cy="12" r="10" />
@@ -174,7 +175,53 @@
 
               <div class="flex items-center gap-3 mt-4 hidden" id="spinner-code">
                 <div class="spinner"></div>
-                <span class="text-muted">Waiting for credential…</span>
+                <span class="text-muted" id="spinner-code-text">Waiting for credential and AGY eligibility check…</span>
+              </div>
+              </div>
+
+              <div id="verify-panel" class="hidden">
+                <div class="alert alert-warning mb-6">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                    <line x1="12" y1="9" x2="12" y2="13" />
+                    <line x1="12" y1="17" x2="12.01" y2="17" />
+                  </svg>
+                  <div>
+                    <strong id="eligibility-title">AGY requires account verification.</strong>
+                    <div id="eligibility-description">This is the official verification URL printed by AGY. Open it now, complete Google verification, then return here and check again.</div>
+                  </div>
+                </div>
+
+                <div id="verify-url-container">
+                  <div class="label-caps mb-4">Verification URL #2</div>
+                  <div class="auth-url-box">
+                    <a id="verify-url-link" href="#" target="_blank" rel="noopener">—</a>
+                  </div>
+                </div>
+
+                <div class="flex gap-3 mt-4 verification-actions">
+                  <button class="btn-primary" id="btn-open-verify-url">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                      <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                    Open Verification URL
+                  </button>
+                  <button class="btn-secondary" id="btn-check-verification">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="23 4 23 10 17 10" />
+                      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                    </svg>
+                    <span id="check-verification-label">I verified — Check Again</span>
+                  </button>
+                </div>
+
+                <div class="flex items-center gap-3 mt-4 hidden" id="spinner-verify">
+                  <div class="spinner"></div>
+                  <span class="text-muted">Checking eligibility with AGY…</span>
+                </div>
+                <div class="form-helper mt-4" id="eligibility-message">Token is not saved until AGY confirms the account no longer requires verification.</div>
               </div>
             </div>
           </div>
@@ -182,8 +229,8 @@
           <!-- Screen 3 — Success -->
           <div id="screen-3" class="card hidden">
             <div class="card-header">
-              Token Saved
-              <span class="badge badge-success">Complete</span>
+              Verified &amp; Token Saved
+              <span class="badge badge-success">Verified</span>
             </div>
             <div class="card-body">
               <div class="alert alert-success mb-6">

@@ -2,6 +2,45 @@
 
 ---
 
+## [2.2.0] — 2026-08-08 — AGY Eligibility / Verification URL #2
+
+### Added — official second-step account verification flow
+
+- **`services/agy-dev/agy_oauth_flow.py`** — real PTY driver that keeps the OAuth
+  authorization code in the same PKCE session, automates AGY onboarding, captures
+  OAuth URL #1 and AGY's official Google verification URL #2, and emits structured
+  markers for the backend. It does not bypass eligibility.
+- **Positive verification evidence** now requires a successful interactive probe
+  response containing a per-run nonce. Merely not seeing URL #2 for N seconds is
+  no longer considered verified.
+- **`POST /api/login/verify-check`** — after the user completes URL #2 in the
+  browser, re-runs AGY eligibility using the existing OAuth credential; no second
+  OAuth/PKCE login is required.
+- **UI verification state** — `verification_required`, `checking_verification`,
+  `verified`, `eligibility_error`, and `eligibility_unknown`; URL #2 gets a dedicated
+  Open button and “I verified — Check Again” action.
+- **Token persistence gate** — Firebase save now happens only after the PTY driver
+  reports verified; credential creation alone is not treated as success.
+- **Failure classification** separates OAuth/PKCE failure, missing/expired
+  credential, network/backend error, unsupported location, no verification URL,
+  and inconclusive probe response.
+- **Session reliability** — verification-required sessions get a separate 20-minute
+  timeout; timeout cleanup releases the Docker login mutex and removes temporary
+  auth handoff state, preventing a timed-out login from blocking all later logins.
+- **SSE replay** returns current status + OAuth URL + verification URL to late or
+  reconnected browsers, reducing fast-host race conditions.
+- **Runtime diagnostics** logs the resolved AGY binary and its version at login
+  start to make upstream regressions easier to correlate.
+- **Optional upstream version guard** (`AGYCLI_AUTH_AGY_EXPECTED_VERSION`) can
+  fail the image build when Google's installer returns an untested AGY version; the
+  healthcheck now executes `agy --version` rather than only checking PATH presence.
+- Docker image now installs `python3`; compose and `.env.example` expose
+  `AGYCLI_AUTH_AGY_LOGIN_FLOW_TIMEOUT_SEC`,
+  `AGYCLI_AUTH_AGY_LOGIN_VERIFY_WAIT_SEC`, and
+  `AGYCLI_AUTH_VERIFICATION_SESSION_TIMEOUT_MS`.
+
+---
+
 ## [2.1.0] — 2026-06-10
 
 ### Fixed — Auth fails on Azure pipeline (works on GitHub Actions)

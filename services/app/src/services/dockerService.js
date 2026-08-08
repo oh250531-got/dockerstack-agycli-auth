@@ -35,11 +35,13 @@ const CONFIG = {
   // ⬆️ Default nâng 1s → 5s: trên Azure cold-start agent, 1s quá gắt khiến agy
   //    chưa kịp in OAuth URL trong print-mode. Vẫn override được qua env.
   authProbeTimeout: process.env.AGY_LOGIN_PRINT_TIMEOUT || "5s",
+  authFlowTimeoutSec: parseInt(process.env.AGY_LOGIN_FLOW_TIMEOUT_SEC || "420", 10),
+  verifyWaitSec: parseInt(process.env.AGY_LOGIN_VERIFY_WAIT_SEC || "45", 10),
   // ⏱️ Thời gian backend chờ OAuth URL xuất hiện trên stdout/stderr (ms).
   //    Trước đây hardcode 30s trong login.js, không cấu hình được → trên môi
   //    trường chậm (Azure) thường timeout trước khi URL kịp in. Mặc định 60s.
   urlWaitTimeoutMs: parseInt(process.env.AGY_URL_WAIT_TIMEOUT_MS || "60000", 10),
-  credentialCheckTimeoutMs: parseInt(process.env.AGY_CREDENTIAL_CHECK_TIMEOUT || "20000", 10),
+  credentialCheckTimeoutMs: parseInt(process.env.AGY_CREDENTIAL_CHECK_TIMEOUT || "60000", 10),
   credentialCheckIntervalMs: parseInt(process.env.AGY_CREDENTIAL_CHECK_INTERVAL || "500", 10),
   codeWriteTimeoutMs: 15_000,
   snapshotRoots: parseEnvList(process.env.AGY_SNAPSHOT_ROOTS || "/root"),
@@ -643,7 +645,15 @@ async function checkAgyBinary(containerName = CONFIG.containerName) {
     );
     const resolved = stdout.trim();
     if (resolved) {
-      return { ok: true, path: resolved, error: null };
+      let version = 'unknown';
+      try {
+        const versionResult = await execDocker(
+          ['exec', containerName, 'sh', '-lc', `${shellQuote(resolved)} --version 2>&1 | head -n 1`],
+          { timeoutMs: 8000 },
+        );
+        version = (versionResult.stdout || '').trim() || 'unknown';
+      } catch (_) {}
+      return { ok: true, path: resolved, version, error: null };
     }
     return {
       ok: false,
@@ -780,6 +790,10 @@ function spawnAgySession({ containerName, fifoPath, sessionId }) {
     "-e",
     `AGY_LOGIN_PRINT_TIMEOUT=${CONFIG.authProbeTimeout}`,
     "-e",
+    `AGY_LOGIN_FLOW_TIMEOUT_SEC=${CONFIG.authFlowTimeoutSec}`,
+    "-e",
+    `AGY_LOGIN_VERIFY_WAIT_SEC=${CONFIG.verifyWaitSec}`,
+    "-e",
     `AGY_LOGIN_CODE_FIFO=${fifoPath}`,
     "-e",
     `AGY_LOGIN_CODE_FILE=${getCodeFilePath(fifoPath)}`,
@@ -799,6 +813,28 @@ function spawnAgySession({ containerName, fifoPath, sessionId }) {
  * Write the authorization code into the FIFO inside the container.
  * Ported from wrapper.js#writeAuthCodeToContainer. 10s timeout.
  */
+
+function spawnAgyEligibilityProbe({ containerName, sessionId }) {
+  const args = [
+    "exec",
+    "-e",
+    `AGY_LOGIN_PROMPT=${CONFIG.authProbePrompt}`,
+    "-e",
+    `AGY_LOGIN_FLOW_TIMEOUT_SEC=${Math.min(CONFIG.authFlowTimeoutSec, 180)}`,
+    "-e",
+    `AGY_LOGIN_VERIFY_WAIT_SEC=${CONFIG.verifyWaitSec}`,
+    containerName,
+    "/exec-wrapper.sh",
+    "agy",
+    "verify-check",
+  ];
+  log.step(`Spawning agy eligibility probe ${sessionId}: docker ${args.join(" ")}`);
+  return spawn("docker", args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: process.env,
+  });
+}
+
 function writeCodeToContainer(containerName, fifoPath, code) {
   const codeFilePath = getCodeFilePath(fifoPath);
   return execDocker(
@@ -828,6 +864,7 @@ module.exports = {
   createFifo,
   cleanupFifo,
   spawnAgySession,
+  spawnAgyEligibilityProbe,
   writeCodeToContainer,
   waitForCredential,
   readCredentialFile,

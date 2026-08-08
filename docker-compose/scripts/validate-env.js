@@ -287,6 +287,25 @@ checkOptional("AGYCLI_AUTH_SESSION_TIMEOUT_MS", "auto-cleanup timeout per login 
   const n = Number(v);
   return Number.isInteger(n) && n >= 60000 ? null : "must be integer >= 60000";
 });
+checkOptional("AGYCLI_AUTH_VERIFICATION_SESSION_TIMEOUT_MS", "auto-cleanup timeout while waiting for account verification (ms)", (v) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 60000 ? null : "must be integer >= 60000";
+});
+checkOptional("AGYCLI_AUTH_AGY_EXPECTED_VERSION", "optional tested AGY version guard", (v) =>
+  /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(v) ? null : "must look like 1.1.7 or v1.1.7",
+);
+checkOptional("AGYCLI_AUTH_AGY_LOGIN_FLOW_TIMEOUT_SEC", "overall PTY auth/eligibility flow timeout (seconds)", (v) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 30 ? null : "must be integer >= 30";
+});
+checkOptional("AGYCLI_AUTH_AGY_LOGIN_VERIFY_WAIT_SEC", "max wait for positive eligibility probe response (seconds)", (v) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 10 ? null : "must be integer >= 10";
+});
+checkOptional("AGYCLI_AUTH_AGY_CREDENTIAL_CHECK_TIMEOUT_MS", "wait for OAuth credential file after code submit (ms)", (v) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 5000 ? null : "must be integer >= 5000";
+});
 
 // Firebase: either BASE64 must be set OR a valid host JSON file must exist.
 {

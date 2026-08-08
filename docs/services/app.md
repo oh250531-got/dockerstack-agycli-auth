@@ -17,14 +17,18 @@ Frontend (Falcon Dashboard UI – served from /public)
     │  POST /api/login/start
     │  GET  /api/login/stream/:sessionId  (SSE)
     │  POST /api/login/submit-code
+    │  POST /api/login/verify-check
     │  GET  /api/tokens
     ▼
 Backend Express (services/app)
     │  docker exec ${AGYCLI_AUTH_CONTAINER_NAME}
-    │  poll credential file
-    │  read token → Firebase Admin SDK
+    │  keep same PTY for OAuth/PKCE
+    │  wait for AGY eligibility result
+    │  verified → read token → Firebase Admin SDK
+    │  not verified → expose official URL #2 → re-check
     ▼
 Container `agy-dev` (sibling, services/agy-dev)
+    │  Python PTY driver + official `agy` binary
     │  /root/.gemini/antigravity-cli/antigravity-oauth-token
     ▼
 Firebase Realtime Database
@@ -73,6 +77,11 @@ Firebase Realtime Database
 | `AGYCLI_AUTH_AGY_SNAPSHOT_COPY_LIMIT`                  | Số file tối đa copy mỗi lần snapshot.                                    |
 | `AGYCLI_AUTH_AGY_SNAPSHOT_MAX_FILE_BYTES`              | Kích thước tối đa cho mỗi file snapshot (byte).                          |
 | `AGYCLI_AUTH_SESSION_TIMEOUT_MS`                       | Auto-cleanup login session sau N ms (mặc định 600000 = 10 phút).         |
+| `AGYCLI_AUTH_VERIFICATION_SESSION_TIMEOUT_MS`          | Gia hạn session khi đang chờ URL #2/verify (mặc định 1200000 = 20 phút). |
+| `AGYCLI_AUTH_AGY_EXPECTED_VERSION`                      | Optional build guard để chặn upstream AGY version chưa test.             |
+| `AGYCLI_AUTH_AGY_LOGIN_FLOW_TIMEOUT_SEC`                | Timeout tổng cho PTY auth/eligibility flow (mặc định 420s).              |
+| `AGYCLI_AUTH_AGY_LOGIN_VERIFY_WAIT_SEC`                 | Timeout chờ probe response/eligibility rõ ràng (mặc định 45s).           |
+| `AGYCLI_AUTH_AGY_CREDENTIAL_CHECK_TIMEOUT_MS`           | Timeout chờ credential sau OAuth code (mặc định 60000ms).                |
 | `AGYCLI_AUTH_FIREBASE_SERVICE_ACCOUNT_BASE64`          | Base64 service account JSON (ưu tiên).                                   |
 | `AGYCLI_AUTH_FIREBASE_SERVICE_ACCOUNT_HOST_PATH`       | Path JSON trên host, mount RO vào `/run/secrets/firebase-adminsdk.json`. |
 | `AGYCLI_AUTH_FIREBASE_PROJECT_ID`                      | Fallback project ID nếu JSON không có.                                   |
@@ -103,6 +112,25 @@ Tất cả volumes nằm dưới `${DOCKER_VOLUMES_ROOT}` → được Rclone ba
 `ENABLE_RCLONE=true`.
 
 ---
+
+## Luồng OAuth + Eligibility/Verify
+
+```text
+Start Login
+  → URL #1 (Google OAuth)
+  → submit authorization code vào CÙNG PTY/PKCE session
+  → credential file xuất hiện
+  → AGY eligibility check
+      ├─ probe response thành công → VERIFIED → save Firebase token
+      ├─ AGY in URL #2           → VERIFICATION_REQUIRED
+      │    → user verify trên browser
+      │    → POST /api/login/verify-check
+      │    → dùng credential hiện có, không OAuth lại
+      └─ network/location/error  → ELIGIBILITY_ERROR / UNKNOWN, không save token
+```
+
+URL #2 được giữ nguyên như AGY in ra; backend không tự dựng, không decode và
+không thêm `login_hint`. Đây là luồng verify chính thức, không bypass eligibility.
 
 ## SSE / Streaming
 
@@ -148,6 +176,7 @@ Chạy mỗi 30s, timeout 5s, retries 3, `start_period: 15s`.
 | POST   | `/api/login/start`                | Bắt đầu phiên login (`{ email, sessionId }`).       |
 | GET    | `/api/login/stream/:sessionId`    | SSE stream sự kiện phiên login.                    |
 | POST   | `/api/login/submit-code`          | Submit auth code (`{ sessionId, code }`).           |
+| POST   | `/api/login/verify-check`         | Re-check eligibility bằng credential OAuth hiện có. |
 | POST   | `/api/login/reset`                | Kill phiên login + cleanup (`{ sessionId }`).       |
 | GET    | `/api/tokens`                     | Liệt kê token đã lưu (chỉ metadata).               |
 | GET    | `/api/deploy-info`                | Thông tin deploy + runner env (debug).             |
@@ -162,8 +191,11 @@ Chạy mỗi 30s, timeout 5s, retries 3, `start_period: 15s`.
 | `firebase.ready: false`                                    | Set `AGYCLI_AUTH_FIREBASE_SERVICE_ACCOUNT_BASE64` hoặc đặt JSON file đúng path. |
 | `docker.daemonOk: false`                                   | Kiểm tra `/var/run/docker.sock` có được mount + daemon đang chạy.        |
 | `error.code: CONTAINER_MISSING`                            | Service `agy-dev` chưa start; chạy `npm run dockerapp-exec:up`.          |
-| `No auth URL detected within 30s`                          | Rebuild `agy-dev`: `docker compose build agy-dev` rồi up lại.            |
+| `No auth URL detected within 60s`                          | Rebuild `agy-dev`: `docker compose build agy-dev` rồi up lại.            |
 | Login OK nhưng SSE không update                            | Caddy thiếu `flush_interval=-1` → kiểm tra labels trong `compose.apps.yml`.|
+| OAuth OK nhưng hiện `Verification required`                | Mở URL #2 ngay, hoàn tất verify Google, rồi bấm **I verified — Check Again**. |
+| `Eligibility check error` nhưng không có URL #2          | Không giả định là chưa verify; xem log network/backend/location và thử **Check Again** nếu retryable. |
+| URL #2 mở muộn trả HTTP 400                              | URL có token tạm; lấy URL mới bằng **Check Again** thay vì lưu URL lâu dài. |
 
 ---
 

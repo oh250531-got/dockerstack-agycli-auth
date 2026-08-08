@@ -2,18 +2,22 @@
 
 /**
  * routes/login.js
- * Endpoints:
- *   POST /api/login/start          — kick off agy session, capture auth URL
- *   GET  /api/login/stream/:id     — SSE channel for that session
- *   POST /api/login/submit-code    — feed auth code back into the container
- *   POST /api/login/reset          — kill session + clean up
+ *
+ * Official AGY login + eligibility flow:
+ *   OAuth URL -> auth code -> credential -> AGY eligibility check
+ *     -> verified -> save token
+ *     -> verification_required -> expose AGY's official URL #2 -> re-check
+ *
+ * This flow does not bypass AGY eligibility. The second URL is captured from
+ * AGY's own output and the token is only marked complete after AGY no longer
+ * requests account verification.
  */
 
 const express = require('express');
 const docker = require('../services/dockerService');
 const sessions = require('../services/sessionManager');
 const firebase = require('../services/firebaseService');
-const { extractUrl, addEmailHint } = require('../utils/urlExtract');
+const { addEmailHint } = require('../utils/urlExtract');
 const { isValidEmail, isValidSessionId } = require('../utils/sanitize');
 
 const router = express.Router();
@@ -25,6 +29,10 @@ const log = {
   ok:   (msg) => console.log(`✓  [LOGIN] ${msg}`),
 };
 
+const OAUTH_URL_RE = /https?:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s\x1b\x07<>"'{}|\\^`]+/i;
+const VERIFY_URL_RE = /https?:\/\/accounts\.google\.com\/signin\/continue\?[^\s\x1b\x07<>"'{}|\\^`]+/i;
+const MARKER_RE = /__AGY_(OAUTH_URL|VERIFY_URL|FLOW_STATUS|FLOW_ERROR)__=([^\r\n]+)/g;
+
 function emitAuthLog(sessionId, level, message, details = null) {
   if (level === 'error') log.err(`[${sessionId}] ${message}`);
   else if (level === 'warning') log.warn(`[${sessionId}] ${message}`);
@@ -34,55 +42,357 @@ function emitAuthLog(sessionId, level, message, details = null) {
   sessions.appendLog(sessionId, { level, message, details });
 }
 
+function redactSecrets(text) {
+  return String(text || '')
+    .replace(/([A-Za-z0-9_-]{40,})/g, (m) => `${m.slice(0, 6)}…[${m.length} chars redacted]`)
+    .replace(/([?&](?:code|token|access_token|refresh_token|client_secret|plt|state|code_challenge)=)[^&\s]+/gi, '$1[redacted]');
+}
+
+function buildAuthDiagnostics(session) {
+  const out = redactSecrets(session.stdoutBuf || '').trim();
+  const err = redactSecrets(session.stderrBuf || '').trim();
+  const tail = (s) => (s ? s.split(/\r?\n/).slice(-30).join('\n') : '(empty)');
+  let hint = '';
+  const combined = `${out}\n${err}`;
+  if (/__AGY_BINARY_MISSING__/.test(combined) || /agy_binary_missing/i.test(combined)) {
+    hint = 'Binary `agy` không có trong container — rebuild agy-dev.';
+  } else if (!out && !err) {
+    hint = 'agy không in ra gì — kiểm tra container/agy và `docker logs agy-dev`.';
+  }
+  return {
+    hint,
+    text: `--- stdout (tail) ---\n${tail(out)}\n\n--- stderr (tail) ---\n${tail(err)}`,
+  };
+}
+
+function cleanCapturedUrl(raw) {
+  return String(raw || '').trim().replace(/[\])};,.:>"']+$/g, '');
+}
+
+function errorMessageForReason(reason) {
+  switch (reason) {
+    case 'oauth_token_exchange_failed':
+      return 'OAuth token exchange failed. Authorization code có thể sai, đã dùng rồi, hoặc không thuộc đúng PKCE session.';
+    case 'credential_missing_or_expired':
+      return 'Credential AGY không còn tồn tại hoặc đã hết hiệu lực. Hãy Login lại.';
+    case 'eligibility_location_unsupported':
+      return 'AGY báo tài khoản/kết nối hiện tại không được hỗ trợ theo location. Đây không phải trường hợp có thể giải quyết bằng URL verify.';
+    case 'eligibility_network_error':
+      return 'Eligibility check lỗi mạng/backend. Token chưa được đánh dấu verified; có thể bấm Check Again sau khi kết nối ổn định.';
+    case 'eligibility_failed_without_verify_url':
+      return 'AGY báo eligibility failed nhưng không in được verification URL. Hãy Check Again hoặc xem log chi tiết.';
+    case 'eligibility_inconclusive_no_probe_response':
+      return 'AGY không trả về probe response trong thời gian chờ. Không coi là verified; có thể do model/backend/network chậm hoặc lỗi. Hãy Check Again.';
+    case 'flow_timeout':
+      return 'AGY eligibility flow hết thời gian chờ trước khi có kết quả rõ ràng.';
+    case 'agy_binary_missing':
+      return 'agy CLI không có trong container agy-dev.';
+    default:
+      return `AGY auth/eligibility error: ${reason || 'unknown'}`;
+  }
+}
+
+async function finalizeVerifiedSession(sessionId) {
+  const session = sessions.getSession(sessionId);
+  if (!session || session.finalizing || session.status === 'success') return;
+  session.finalizing = true;
+  session.eligibilityStatus = 'verified';
+  sessions.updateStatus(sessionId, 'verified');
+  sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'verified' });
+  emitAuthLog(sessionId, 'success', 'AGY eligibility check passed; account does not require verification.');
+
+  try {
+    if (!session.credentialReady) {
+      const credentialOk = await docker.waitForCredential(docker.CONFIG.containerName);
+      if (!credentialOk) throw new Error('Credential disappeared before final save.');
+      session.credentialReady = true;
+    }
+
+    emitAuthLog(sessionId, 'info', 'Reading verified credential file from container.');
+    const raw = await docker.readCredentialFile(docker.CONFIG.containerName);
+
+    let snapshotReport = null;
+    if (session.beforeSnapshot) {
+      try {
+        emitAuthLog(sessionId, 'info', `Taking after snapshot and writing report to ${docker.CONFIG.snapshotOutputDir}.`);
+        const afterSnapshot = await docker.captureFileSnapshot(docker.CONFIG.containerName);
+        snapshotReport = await docker.createLoginSnapshotReport({
+          containerName: docker.CONFIG.containerName,
+          sessionId,
+          email: session.email,
+          before: session.beforeSnapshot,
+          after: afterSnapshot,
+        });
+        sessions.setLoginSnapshot(sessionId, snapshotReport);
+        emitAuthLog(sessionId, 'success', `Snapshot report ready: ${snapshotReport.output.displayDir}.`, {
+          summary: snapshotReport.summary,
+          output: snapshotReport.output,
+        });
+      } catch (err) {
+        emitAuthLog(sessionId, 'warning', `After snapshot/report failed: ${err.message}`);
+      }
+    }
+
+    emitAuthLog(sessionId, 'info', `Saving verified token for ${session.email} to Firebase.`);
+    const key = await firebase.saveToken(session.email, raw, sessionId);
+
+    const tokenSavedEvent = {
+      type: 'token_saved',
+      email: session.email,
+      key,
+      verified: true,
+      savedAt: Date.now(),
+      snapshot: snapshotReport,
+    };
+    session.lastTokenSaved = tokenSavedEvent;
+    sessions.updateStatus(sessionId, 'success', { key, verified: true, savedAt: tokenSavedEvent.savedAt });
+    sessions.emitSSE(sessionId, tokenSavedEvent);
+
+    await docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath).catch(() => {});
+    if (session.childProcess) {
+      try { session.childProcess.kill('SIGTERM'); } catch (_) {}
+    }
+    docker.releaseMutex(sessionId);
+    setTimeout(() => sessions.destroySession(sessionId, { reason: 'success' }), 4000);
+  } catch (err) {
+    session.finalizing = false;
+    session.eligibilityStatus = 'error';
+    sessions.updateStatus(sessionId, 'error');
+    sessions.emitSSE(sessionId, { type: 'error', message: `Final save failed: ${err.message}` });
+    emitAuthLog(sessionId, 'error', `Final save failed: ${err.message}`);
+  }
+}
+
+function handleFlowStatus(sessionId, session, value) {
+  switch (value) {
+    case 'starting':
+    case 'oauth_selected':
+      return;
+    case 'oauth_url_ready':
+      if (!session.authUrl) sessions.updateStatus(sessionId, 'waiting_url');
+      return;
+    case 'waiting_code':
+      if (session.authUrl) sessions.updateStatus(sessionId, 'waiting_code');
+      return;
+    case 'code_submitted':
+      sessions.updateStatus(sessionId, 'credential_wait');
+      return;
+    case 'onboarding_theme_done':
+    case 'onboarding_tos_done':
+    case 'onboarding_trust_done':
+      emitAuthLog(sessionId, 'info', `AGY ${value.replace(/^onboarding_/, '').replace(/_/g, ' ')}.`);
+      return;
+    case 'eligibility_checking':
+      session.eligibilityStatus = 'checking';
+      sessions.updateStatus(sessionId, 'checking_eligibility');
+      sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'checking' });
+      return;
+    case 'verification_required':
+      session.eligibilityStatus = 'verification_required';
+      sessions.updateStatus(sessionId, 'verification_required', { verifyUrl: session.verifyUrl || null });
+      return;
+    case 'verified':
+      void finalizeVerifiedSession(sessionId);
+      return;
+    default:
+      emitAuthLog(sessionId, 'info', `AGY flow status: ${value}`);
+  }
+}
+
+function handleFlowError(sessionId, session, reason) {
+  if (session.status === 'success') return;
+  session.eligibilityStatus = 'error';
+  session.eligibilityReason = reason;
+  const message = errorMessageForReason(reason);
+
+  if (reason === 'oauth_token_exchange_failed' || reason === 'agy_binary_missing') {
+    sessions.updateStatus(sessionId, 'error');
+    sessions.emitSSE(sessionId, { type: 'error', message });
+  } else {
+    sessions.updateStatus(sessionId, 'eligibility_error', { reason });
+    sessions.emitSSE(sessionId, {
+      type: 'eligibility_result',
+      outcome: 'error',
+      reason,
+      message,
+      retryable: reason !== 'eligibility_location_unsupported' && reason !== 'credential_missing_or_expired',
+    });
+  }
+  emitAuthLog(sessionId, 'error', message);
+}
+
+function captureOAuthUrl(sessionId, session, rawUrl) {
+  if (session.authUrl) return;
+  const cleaned = cleanCapturedUrl(rawUrl);
+  if (!cleaned.includes('accounts.google.com/o/oauth2/auth')) return;
+  const finalUrl = addEmailHint(cleaned, session.email);
+  session.authUrl = finalUrl;
+  sessions.updateStatus(sessionId, 'url_ready', { authUrl: finalUrl });
+  sessions.emitSSE(sessionId, { type: 'auth_url', url: finalUrl });
+  emitAuthLog(sessionId, 'success', 'OAuth URL #1 captured with email login_hint.');
+}
+
+function captureVerifyUrl(sessionId, session, rawUrl) {
+  const cleaned = cleanCapturedUrl(rawUrl);
+  if (!cleaned.includes('accounts.google.com/signin/continue')) return;
+  const changed = session.verifyUrl !== cleaned;
+  session.verifyUrl = cleaned;
+  session.eligibilityStatus = 'verification_required';
+  sessions.updateStatus(sessionId, 'verification_required', { verifyUrl: cleaned });
+  sessions.refreshSessionTimeout(sessionId, sessions.VERIFICATION_SESSION_TIMEOUT_MS);
+  if (changed) {
+    sessions.emitSSE(sessionId, { type: 'verify_url', url: cleaned });
+    emitAuthLog(sessionId, 'warning', 'AGY requires account verification; official URL #2 captured.');
+  }
+}
+
+function processStructuredMarkers(sessionId, session, text) {
+  session.markerRemainder = `${session.markerRemainder || ''}${text}`;
+  const lines = session.markerRemainder.split(/\r?\n/);
+  session.markerRemainder = lines.pop() || '';
+  session.markerSeen = session.markerSeen || new Set();
+
+  for (const line of lines) {
+    MARKER_RE.lastIndex = 0;
+    let match;
+    while ((match = MARKER_RE.exec(line)) !== null) {
+      const kind = match[1];
+      const value = String(match[2] || '').trim();
+      const markerKey = `${kind}:${value}`;
+      if (session.markerSeen.has(markerKey)) continue;
+      session.markerSeen.add(markerKey);
+
+      if (kind === 'OAUTH_URL') captureOAuthUrl(sessionId, session, value);
+      else if (kind === 'VERIFY_URL') captureVerifyUrl(sessionId, session, value);
+      else if (kind === 'FLOW_STATUS') handleFlowStatus(sessionId, session, value);
+      else if (kind === 'FLOW_ERROR') handleFlowError(sessionId, session, value);
+    }
+  }
+}
+
+function handleAgyChunk(sessionId, session, chunk, isStderr) {
+  const text = chunk.toString('utf8');
+  if (isStderr) session.stderrBuf += text;
+  else session.stdoutBuf += text;
+
+  processStructuredMarkers(sessionId, session, text);
+
+  // Backward-compatible fallback if a future/older driver prints URLs without markers.
+  if (!session.authUrl) {
+    const found = text.match(OAUTH_URL_RE) || `${session.stdoutBuf}\n${session.stderrBuf}`.match(OAUTH_URL_RE);
+    if (found) captureOAuthUrl(sessionId, session, found[0]);
+  }
+  const verifyFound = text.match(VERIFY_URL_RE);
+  if (verifyFound) captureVerifyUrl(sessionId, session, verifyFound[0]);
+
+  if (text.includes('__AGY_BINARY_MISSING__')) {
+    handleFlowError(sessionId, session, 'agy_binary_missing');
+  }
+}
+
+function attachAgyProcess(sessionId, child, kind) {
+  const session = sessions.getSession(sessionId);
+  if (!session) {
+    try { child.kill('SIGTERM'); } catch (_) {}
+    return;
+  }
+
+  session.childProcess = child;
+  session.childKind = kind;
+  child.stdout.on('data', (c) => handleAgyChunk(sessionId, session, c, false));
+  child.stderr.on('data', (c) => handleAgyChunk(sessionId, session, c, true));
+
+  child.on('close', (code) => {
+    const current = sessions.getSession(sessionId);
+    if (!current) return;
+    current.childExitCode = code;
+    log.info(`agy ${kind} child closed for ${sessionId} (code=${code}, status=${current.status})`);
+
+    if (current.status === 'checking_eligibility' || current.status === 'checking_verification') {
+      // The PTY driver normally emits verified / verification_required / error.
+      // If it exits without one, keep the account unresolved rather than falsely
+      // treating absence of a URL as verified.
+      setTimeout(() => {
+        const s = sessions.getSession(sessionId);
+        if (!s) return;
+        if (s.status === 'checking_eligibility' || s.status === 'checking_verification') {
+          sessions.updateStatus(sessionId, 'eligibility_unknown');
+          sessions.emitSSE(sessionId, {
+            type: 'eligibility_result',
+            outcome: 'unknown',
+            message: `AGY process ended (code=${code}) before a conclusive eligibility result.`,
+          });
+        }
+      }, 500);
+    }
+  });
+
+  child.on('error', (err) => {
+    log.err(`agy ${kind} spawn error for ${sessionId}: ${err.message}`);
+    const current = sessions.getSession(sessionId);
+    if (!current) return;
+    sessions.updateStatus(sessionId, 'eligibility_error', { reason: 'spawn_error' });
+    sessions.emitSSE(sessionId, {
+      type: 'eligibility_result',
+      outcome: 'error',
+      reason: 'spawn_error',
+      message: err.message,
+      retryable: true,
+    });
+  });
+}
+
 // ─── POST /api/login/start ───────────────────────────────────────────────────
 
 router.post('/start', async (req, res) => {
   const { email, sessionId } = req.body || {};
 
-  if (!isValidEmail(email)) {
-    return res.status(400).json({ error: 'Invalid email format' });
-  }
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (!isValidSessionId(sessionId)) {
     return res.status(400).json({ error: 'Invalid sessionId (alphanumeric/_- only, 8-128 chars)' });
   }
+  if (sessions.getSession(sessionId)) return res.status(409).json({ error: 'Session already exists' });
 
-  if (sessions.getSession(sessionId)) {
-    return res.status(409).json({ error: 'Session already exists' });
-  }
-
-  // Acquire global mutex (Option A) — only one active login at a time
   await docker.acquireMutex(sessionId);
 
   try {
     await docker.ensureContainerRunning();
   } catch (err) {
     docker.releaseMutex(sessionId);
-    log.err(`ensureContainerRunning failed: ${err.message}`);
     return res.status(500).json({ error: `Container not available: ${err.message}` });
   }
 
-  // ── Pre-flight: agy binary phải tồn tại trong container ──────────────────
-  // Trên Azure, image agy-dev có thể build hỏng nhưng vẫn chạy (lịch sử dùng
-  // `|| true` khi cài agy). Khi đó login luôn fail với thông báo mơ hồ
-  // "No auth URL". Check sớm để báo đúng nguyên nhân & gợi ý rebuild.
+  let agyRuntime = null;
   try {
     const bin = await docker.checkAgyBinary(docker.CONFIG.containerName);
     if (!bin.ok) {
       docker.releaseMutex(sessionId);
-      log.err(`agy binary check failed: ${bin.error}`);
       return res.status(500).json({ error: `agy CLI unavailable: ${bin.error}` });
     }
-    log.ok(`agy binary resolved at ${bin.path}`);
+    agyRuntime = bin;
+    log.ok(`agy binary resolved at ${bin.path} (${bin.version || 'version unknown'})`);
   } catch (err) {
-    // Không chặn cứng nếu việc check gặp lỗi bất thường — chỉ cảnh báo.
     log.warn(`agy binary check errored (continuing): ${err.message}`);
   }
 
-  const session = sessions.createSession({ sessionId, email });
+  const session = sessions.createSession({
+    sessionId,
+    email,
+    onTimeout: async (timedOutSession) => {
+      if (timedOutSession.childProcess) {
+        try { timedOutSession.childProcess.kill('SIGTERM'); } catch (_) {}
+      }
+      await docker.cleanupFifo(docker.CONFIG.containerName, timedOutSession.fifoPath).catch(() => {});
+      await docker.resetCredential(docker.CONFIG.containerName).catch(() => {});
+      docker.releaseMutex(timedOutSession.sessionId);
+    },
+  });
   emitAuthLog(sessionId, 'info', `Container ${docker.CONFIG.containerName} is running; preparing auth session.`);
+  if (agyRuntime) {
+    emitAuthLog(sessionId, 'info', `AGY runtime: ${agyRuntime.version || 'unknown'} at ${agyRuntime.path}.`);
+  }
 
   try {
-    emitAuthLog(sessionId, 'info', `Creating code FIFO at ${session.fifoPath}.`);
     await docker.createFifo(docker.CONFIG.containerName, session.fifoPath);
   } catch (err) {
     docker.releaseMutex(sessionId);
@@ -90,102 +400,26 @@ router.post('/start', async (req, res) => {
     return res.status(500).json({ error: `Failed to create FIFO: ${err.message}` });
   }
 
-  // Reset old credential so we get a fresh OAuth flow each time
   emitAuthLog(sessionId, 'info', `Removing old credential at ${docker.CONFIG.credentialPath}.`);
   await docker.resetCredential(docker.CONFIG.containerName);
 
-  // Spawn the agy session
-  emitAuthLog(sessionId, 'info', 'Starting agy auth process and waiting for OAuth URL.');
   const child = docker.spawnAgySession({
     containerName: docker.CONFIG.containerName,
     fifoPath: session.fifoPath,
     sessionId,
   });
-  session.childProcess = child;
   sessions.updateStatus(sessionId, 'waiting_url');
+  attachAgyProcess(sessionId, child, 'login');
 
-  // Process stdout/stderr — search for the auth URL
-  function handleChunk(chunk, isStderr) {
-    const text = chunk.toString('utf8');
-    if (isStderr) session.stderrBuf += text;
-    else session.stdoutBuf += text;
-
-    // Try fresh chunk first, fall back to combined buffer once we still have no URL
-    if (!session.authUrl) {
-      const found = extractUrl(text)
-        || extractUrl(session.stdoutBuf + '\n' + session.stderrBuf);
-      if (found) {
-        const finalUrl = addEmailHint(found, session.email);
-        session.authUrl = finalUrl;
-        sessions.updateStatus(sessionId, 'url_ready', { authUrl: finalUrl });
-        sessions.emitSSE(sessionId, { type: 'auth_url', url: finalUrl });
-        emitAuthLog(sessionId, 'success', 'Auth URL captured with email login_hint.');
-        log.ok(`Auth URL captured for session ${sessionId}: ${finalUrl}`);
-      }
-    }
-
-    // Detect known error patterns from agy
-    if (/timed out waiting for response/i.test(text)
-        || /authentication (?:timed out|interrupted)/i.test(text)) {
-      // wrapper.js treats "timed out waiting for response" as benign (auth probe
-      // satisfied) — we just log it. The SSE consumer can still see status.
-      log.warn(`agy notice for ${sessionId}: ${text.trim().slice(0, 200)}`);
-    }
-
-    // Sentinel từ exec-wrapper.sh khi binary `agy` không tồn tại trong image.
-    // Báo lỗi đúng nguyên nhân ngay thay vì để người dùng chờ hết timeout.
-    if (text.includes('__AGY_BINARY_MISSING__') && session.status !== 'success' && session.status !== 'error') {
-      sessions.updateStatus(sessionId, 'error');
-      sessions.emitSSE(sessionId, {
-        type: 'error',
-        message:
-          "agy CLI không có trong container agy-dev (image build hỏng). " +
-          "Rebuild image: docker compose build --no-cache agy-dev. " +
-          "Trên Azure, xoá local buildx cache cho agy-dev rồi build lại.",
-      });
-      emitAuthLog(sessionId, 'error', 'agy binary missing inside container (build broken).');
-    }
-  }
-
-  child.stdout.on('data', (c) => handleChunk(c, false));
-  child.stderr.on('data', (c) => handleChunk(c, true));
-
-  child.on('close', (code) => {
-    log.info(`agy child closed for ${sessionId} (code=${code})`);
-    if (session.status !== 'success' && session.status !== 'error') {
-      // If we never reached success but child ended, surface a soft warning.
-      // Keep session alive so the SSE consumer can still get a final message.
-      sessions.emitSSE(sessionId, {
-        type: 'status',
-        stage: session.status,
-        note: `agy process ended (code=${code})`,
-      });
-    }
-  });
-
-  child.on('error', (err) => {
-    log.err(`agy spawn error for ${sessionId}: ${err.message}`);
-    sessions.emitSSE(sessionId, { type: 'error', message: err.message });
-    sessions.updateStatus(sessionId, 'error');
-  });
-
-  // Configurable safety timeout: nếu chưa có URL, emit lỗi KÈM CHẨN ĐOÁN
-  // (trích đoạn stdout/stderr đã ẩn token) để lộ nguyên nhân thật, thay vì
-  // chỉ "No auth URL within 30s" như trước. Timeout cấu hình qua
-  // AGY_URL_WAIT_TIMEOUT_MS (mặc định 60s) — môi trường chậm (Azure) cần dài hơn.
   const urlWaitMs = docker.CONFIG.urlWaitTimeoutMs || 60_000;
   setTimeout(() => {
     const s = sessions.getSession(sessionId);
     if (s && !s.authUrl && s.status !== 'success' && s.status !== 'error') {
       const waitSec = Math.round(urlWaitMs / 1000);
       const diag = buildAuthDiagnostics(s);
-      log.err(`No auth URL for ${sessionId} within ${waitSec}s. stdout/stderr tail:\n${diag.text}`);
       sessions.emitSSE(sessionId, {
         type: 'error',
-        message:
-          `No auth URL detected within ${waitSec}s. ` +
-          (diag.hint ? `${diag.hint} ` : '') +
-          'Xem chi tiết log bên dưới hoặc thử reset rồi bắt đầu lại.',
+        message: `No auth URL detected within ${waitSec}s. ${diag.hint || ''}`.trim(),
         details: { diagnostics: diag.text },
       });
       emitAuthLog(sessionId, 'error', `Timeout chờ OAuth URL (${waitSec}s).`, { diagnostics: diag.text });
@@ -195,43 +429,13 @@ router.post('/start', async (req, res) => {
   return res.json({ success: true, sessionId });
 });
 
-// Ẩn token/secret rồi trả về phần đuôi stdout/stderr để chẩn đoán khi timeout.
-function redactSecrets(text) {
-  return String(text || '')
-    // OAuth/credential token: chuỗi dài liên tục → rút gọn
-    .replace(/([A-Za-z0-9_-]{40,})/g, (m) => `${m.slice(0, 6)}…[${m.length} chars redacted]`)
-    // Tham số nhạy cảm trong URL
-    .replace(/([?&](?:code|token|access_token|refresh_token|client_secret)=)[^&\s]+/gi, '$1[redacted]');
-}
-
-function buildAuthDiagnostics(session) {
-  const out = redactSecrets(session.stdoutBuf || '').trim();
-  const err = redactSecrets(session.stderrBuf || '').trim();
-  const tail = (s) => (s ? s.split(/\r?\n/).slice(-20).join('\n') : '(empty)');
-  let hint = '';
-  const combined = `${out}\n${err}`;
-  if (/__AGY_BINARY_MISSING__/.test(combined)) {
-    hint = 'Nguyên nhân: binary `agy` không có trong container (image build hỏng) — rebuild agy-dev.';
-  } else if (!out && !err) {
-    hint = 'agy không in ra gì — có thể container/agy không khởi động đúng. Kiểm tra `docker logs agy-dev`.';
-  }
-  return {
-    hint,
-    text: `--- stdout (tail) ---\n${tail(out)}\n\n--- stderr (tail) ---\n${tail(err)}`,
-  };
-}
-
 // ─── GET /api/login/stream/:sessionId ────────────────────────────────────────
 
 router.get('/stream/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-  if (!isValidSessionId(sessionId)) {
-    return res.status(400).end();
-  }
+  if (!isValidSessionId(sessionId)) return res.status(400).end();
   const session = sessions.getSession(sessionId);
-  if (!session) {
-    return res.status(404).end();
-  }
+  if (!session) return res.status(404).end();
 
   res.set({
     'Content-Type': 'text/event-stream',
@@ -241,7 +445,6 @@ router.get('/stream/:sessionId', (req, res) => {
   });
   res.flushHeaders?.();
   res.write('retry: 3000\n\n');
-
   sessions.attachSSE(sessionId, res);
 
   const heartbeat = setInterval(() => {
@@ -251,7 +454,6 @@ router.get('/stream/:sessionId', (req, res) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     sessions.detachSSE(sessionId);
-    log.info(`SSE client disconnected for ${sessionId}`);
   });
 });
 
@@ -268,10 +470,7 @@ router.get('/snapshots/:snapshotId/changed-files.tar.gz', async (req, res) => {
     });
     await docker.streamChangedFilesArchive(info, res);
   } catch (err) {
-    if (res.headersSent) {
-      res.destroy(err);
-      return;
-    }
+    if (res.headersSent) return res.destroy(err);
     res.status(err.statusCode || 500).json({ error: err.message || 'Download failed' });
   }
 });
@@ -280,9 +479,7 @@ router.get('/snapshots/:snapshotId/changed-files.tar.gz', async (req, res) => {
 
 router.post('/submit-code', async (req, res) => {
   const { sessionId, code } = req.body || {};
-  if (!isValidSessionId(sessionId)) {
-    return res.status(400).json({ error: 'Invalid sessionId' });
-  }
+  if (!isValidSessionId(sessionId)) return res.status(400).json({ error: 'Invalid sessionId' });
   if (!code || typeof code !== 'string' || code.length < 4) {
     return res.status(400).json({ error: 'Invalid auth code' });
   }
@@ -290,117 +487,88 @@ router.post('/submit-code', async (req, res) => {
   const session = sessions.getSession(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (session.status !== 'url_ready' && session.status !== 'waiting_code') {
-    return res.status(409).json({
-      error: `Session not ready for code (status=${session.status})`,
-    });
+    return res.status(409).json({ error: `Session not ready for code (status=${session.status})` });
   }
 
   sessions.updateStatus(sessionId, 'waiting_code');
-  emitAuthLog(sessionId, 'info', `Grant auth code started for container ${docker.CONFIG.containerName}.`);
+  emitAuthLog(sessionId, 'info', 'Submitting authorization code into the same PTY/PKCE session.');
 
-  let beforeSnapshot = null;
   try {
-    emitAuthLog(sessionId, 'info', `Taking before snapshot: ${docker.CONFIG.snapshotRoots.join(', ')}.`);
-    beforeSnapshot = await docker.captureFileSnapshot(docker.CONFIG.containerName);
-    emitAuthLog(sessionId, 'success', `Before snapshot captured: ${beforeSnapshot.fileCount} files.`);
+    session.beforeSnapshot = await docker.captureFileSnapshot(docker.CONFIG.containerName);
+    emitAuthLog(sessionId, 'success', `Before snapshot captured: ${session.beforeSnapshot.fileCount} files.`);
   } catch (err) {
     emitAuthLog(sessionId, 'warning', `Before snapshot failed: ${err.message}`);
   }
 
   try {
-    emitAuthLog(sessionId, 'info', `Writing auth code handoff file for ${session.fifoPath}.`);
-    await docker.writeCodeToContainer(
-      docker.CONFIG.containerName,
-      session.fifoPath,
-      code.trim(),
-    );
+    await docker.writeCodeToContainer(docker.CONFIG.containerName, session.fifoPath, code.trim());
   } catch (err) {
-    log.err(`writeCodeToContainer failed for ${sessionId}: ${err.message}`);
     sessions.emitSSE(sessionId, { type: 'error', message: `Failed to submit code: ${err.message}` });
     return res.status(500).json({ error: err.message });
   }
 
-  log.ok(`Code submitted for ${sessionId}; polling for credential...`);
-  emitAuthLog(sessionId, 'info', `Code submitted; polling credential at ${docker.CONFIG.credentialPath}.`);
+  sessions.updateStatus(sessionId, 'credential_wait');
   const ok = await docker.waitForCredential(docker.CONFIG.containerName);
   if (!ok) {
     sessions.emitSSE(sessionId, {
       type: 'error',
-      message: 'Credential file did not appear within 20s. The code may be wrong.',
+      message: 'Credential file did not appear in time. Code may be wrong/expired or PKCE session mismatched.',
     });
-    return res.status(504).json({ error: 'Credential not detected (timeout). Wrong code?' });
-  }
-  emitAuthLog(sessionId, 'success', 'Credential file detected inside container.');
-
-  let raw;
-  try {
-    emitAuthLog(sessionId, 'info', 'Reading credential file from container.');
-    raw = await docker.readCredentialFile(docker.CONFIG.containerName);
-  } catch (err) {
-    sessions.emitSSE(sessionId, { type: 'error', message: `Read credential failed: ${err.message}` });
-    return res.status(500).json({ error: err.message });
+    return res.status(504).json({ error: 'Credential not detected (timeout).' });
   }
 
-  let snapshotReport = null;
-  if (beforeSnapshot) {
-    try {
-      emitAuthLog(sessionId, 'info', `Taking after snapshot and writing report to ${docker.CONFIG.snapshotOutputDir}.`);
-      const afterSnapshot = await docker.captureFileSnapshot(docker.CONFIG.containerName);
-      snapshotReport = await docker.createLoginSnapshotReport({
-        containerName: docker.CONFIG.containerName,
-        sessionId,
-        email: session.email,
-        before: beforeSnapshot,
-        after: afterSnapshot,
-      });
-      sessions.setLoginSnapshot(sessionId, snapshotReport);
-      emitAuthLog(sessionId, 'success', `Snapshot report ready: ${snapshotReport.output.displayDir}.`, {
-        summary: snapshotReport.summary,
-        output: snapshotReport.output,
-      });
-    } catch (err) {
-      emitAuthLog(sessionId, 'warning', `After snapshot/report failed: ${err.message}`);
-    }
+  session.credentialReady = true;
+  emitAuthLog(sessionId, 'success', 'OAuth credential created. Waiting for AGY eligibility result before saving token.');
+
+  if (session.status !== 'verification_required' && session.status !== 'verified' && session.status !== 'success') {
+    session.eligibilityStatus = 'checking';
+    sessions.updateStatus(sessionId, 'checking_eligibility');
+    sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'checking' });
   }
 
-  let key;
-  try {
-    emitAuthLog(sessionId, 'info', `Saving token for ${session.email} to Firebase.`);
-    key = await firebase.saveToken(session.email, raw, sessionId);
-  } catch (err) {
-    log.err(`Firebase saveToken failed: ${err.message}`);
-    sessions.emitSSE(sessionId, { type: 'error', message: `Firebase save failed: ${err.message}` });
-    return res.status(500).json({ error: `Firebase save failed: ${err.message}` });
+  return res.json({ success: true, stage: session.status, credentialReady: true });
+});
+
+// ─── POST /api/login/verify-check ────────────────────────────────────────────
+
+router.post('/verify-check', async (req, res) => {
+  const { sessionId } = req.body || {};
+  if (!isValidSessionId(sessionId)) return res.status(400).json({ error: 'Invalid sessionId' });
+  const session = sessions.getSession(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (session.status === 'success') return res.json({ success: true, stage: 'success' });
+
+  const credentialOk = session.credentialReady || await docker.waitForCredential(docker.CONFIG.containerName);
+  if (!credentialOk) {
+    return res.status(409).json({ error: 'Credential missing; please login again.' });
   }
+  session.credentialReady = true;
+  session.eligibilityStatus = 'checking';
+  session.eligibilityReason = null;
 
-  sessions.updateStatus(sessionId, 'success', { key });
-  sessions.emitSSE(sessionId, {
-    type: 'token_saved',
-    email: session.email,
-    key,
-    savedAt: Date.now(),
-    snapshot: snapshotReport,
-  });
-
-  // Cleanup
-  await docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath);
   if (session.childProcess) {
     try { session.childProcess.kill('SIGTERM'); } catch (_) {}
   }
-  docker.releaseMutex(sessionId);
-  // Defer destroy briefly so the SSE consumer receives the success event
-  setTimeout(() => sessions.destroySession(sessionId, { reason: 'success' }), 2000);
 
-  return res.json({ success: true, key, email: session.email });
+  sessions.updateStatus(sessionId, 'checking_verification');
+  sessions.refreshSessionTimeout(sessionId, sessions.VERIFICATION_SESSION_TIMEOUT_MS);
+  sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'checking' });
+  emitAuthLog(sessionId, 'info', 'Re-checking AGY eligibility using the existing OAuth credential.');
+
+  const child = docker.spawnAgyEligibilityProbe({
+    containerName: docker.CONFIG.containerName,
+    sessionId,
+  });
+  attachAgyProcess(sessionId, child, 'eligibility');
+
+  return res.json({ success: true, stage: 'checking_verification' });
 });
 
 // ─── POST /api/login/reset ────────────────────────────────────────────────────
 
 router.post('/reset', async (req, res) => {
   const { sessionId } = req.body || {};
-  if (!isValidSessionId(sessionId)) {
-    return res.status(400).json({ error: 'Invalid sessionId' });
-  }
+  if (!isValidSessionId(sessionId)) return res.status(400).json({ error: 'Invalid sessionId' });
   const session = sessions.getSession(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
 

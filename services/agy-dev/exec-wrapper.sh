@@ -35,14 +35,29 @@ if [[ -z "${RESOLVED_CMD}" ]]; then
   exit 127
 fi
 
-# `auth-wait` was the old wrapper-facing command. The current agy CLI does not
-# expose it as a real subcommand; print mode is the stable way to trigger auth
-# and emit the OAuth URL.
+# Web auth driver modes. These keep OAuth inside one real PTY (PKCE-safe),
+# automate the normal AGY onboarding screens, and capture AGY's official
+# eligibility/verification URL. No eligibility check is bypassed.
 if [[ "${CMD}" == "agy" && "${1:-}" == "auth-wait" ]]; then
   shift || true
-  set -- \
-    "--print-timeout" "${AGY_LOGIN_PRINT_TIMEOUT:-5s}" \
-    "--print" "${AGY_LOGIN_PROMPT:-__antigravity_auth_check__}" \
+  exec python3 /agy_oauth_flow.py \
+    --mode login \
+    --agy-binary "${RESOLVED_CMD}" \
+    --code-file "${AGY_LOGIN_CODE_FILE:-/tmp/agy-auth-code}" \
+    --timeout "${AGY_LOGIN_FLOW_TIMEOUT_SEC:-420}" \
+    --verify-wait "${AGY_LOGIN_VERIFY_WAIT_SEC:-45}" \
+    --prompt "${AGY_LOGIN_PROMPT:-Reply with OK}" \
+    "$@"
+fi
+
+if [[ "${CMD}" == "agy" && "${1:-}" == "verify-check" ]]; then
+  shift || true
+  exec python3 /agy_oauth_flow.py \
+    --mode eligibility \
+    --agy-binary "${RESOLVED_CMD}" \
+    --timeout "${AGY_LOGIN_FLOW_TIMEOUT_SEC:-180}" \
+    --verify-wait "${AGY_LOGIN_VERIFY_WAIT_SEC:-45}" \
+    --prompt "${AGY_LOGIN_PROMPT:-Reply with OK}" \
     "$@"
 fi
 

@@ -3,9 +3,11 @@
 # Biến đầu vào (truyền qua env):
 #   AGY_INSTALL_URL  — URL của install.sh (default: https://antigravity.google/cli/install.sh)
 #   AGYCLI_CACHE_BUILD   — Dùng để bust Docker cache, không ảnh hưởng logic cài đặt
+#   AGY_EXPECTED_VERSION — Optional guard; fail build if installed version does not match
 set -eu
 
 AGY_INSTALL_URL="${AGY_INSTALL_URL:-https://antigravity.google/cli/install.sh}"
+AGY_EXPECTED_VERSION="${AGY_EXPECTED_VERSION:-}"
 export PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 
 echo "==> [agy-install] cache bust: ${AGYCLI_CACHE_BUILD:-unset}"
@@ -43,5 +45,21 @@ if ! command -v agy >/dev/null 2>&1; then
   exit 1
 fi
 
-AGY_VERSION=$(agy --version 2>/dev/null || echo "unknown")
+if ! AGY_VERSION="$(agy --version 2>&1)"; then
+  echo "[agy-install] FAILED: agy binary exists but 'agy --version' cannot execute." >&2
+  exit 1
+fi
+AGY_VERSION="$(printf '%s' "$AGY_VERSION" | head -n 1 | tr -d '\r')"
+
+if [ -n "$AGY_EXPECTED_VERSION" ]; then
+  case "$AGY_VERSION" in
+    *"$AGY_EXPECTED_VERSION"*) ;;
+    *)
+      echo "[agy-install] FAILED: installed version '$AGY_VERSION' does not match AGY_EXPECTED_VERSION='$AGY_EXPECTED_VERSION'." >&2
+      echo "[agy-install] This guard prevents an untested upstream auto-update from entering the stable stack." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 echo "==> [agy-install] OK: agy ${AGY_VERSION} at $(command -v agy)"
