@@ -59,6 +59,7 @@
     "tailscale-init": "node tailscale/tailscale-init.js .env",
     "ocli-gh": "dotenvrtdb -e .env -- ocli gh",
     "ocli-azure": "dotenvrtdb -e .env -- ocli azure",
-    "env-push": "dotenvrtdb -e .env --push -eUrl=$env:DOTENVRTDB_URL"
+    "env-push": "dotenvrtdb -e .env --push -eUrl=$env:DOTENVRTDB_URL",
+    "ghw:oh250531-got0SouthEastAsia": "ghw --profile oh250531-got --location SouthEastAsia --repo dockerstack-agycli-auth --tmux"
   }
 }

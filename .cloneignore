@@ -1,0 +1,74 @@
+# File này do gitlocalclone tự tạo (chưa từng tồn tại trước đó).
+# Cú pháp giống hệt .gitignore. Sửa/xóa tùy ý.
+
+# --- Git ---
+.git/
+
+# --- Node.js / JavaScript / TypeScript ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.pnp.*
+dist/
+build/
+out/
+.next/
+.nuxt/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# --- C# / .NET ---
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+packages/
+.vs/
+*.pdb
+
+# --- Java / Kotlin / Gradle / Maven ---
+target/
+*.class
+.gradle/
+.mvn/
+*.jar
+*.war
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+
+# --- Go ---
+vendor/
+
+# --- Rust ---
+/target/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Log / cache / temp chung ---
+*.log
+.cache/
+tmp/
+temp/
