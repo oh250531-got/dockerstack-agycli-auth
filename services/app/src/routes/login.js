@@ -166,6 +166,12 @@ async function finalizeVerifiedSession(sessionId) {
     sessions.updateStatus(sessionId, 'error');
     sessions.emitSSE(sessionId, { type: 'error', message: `Final save failed: ${err.message}` });
     emitAuthLog(sessionId, 'error', `Final save failed: ${err.message}`);
+    await docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath).catch(() => {});
+    if (session.childProcess) {
+      try { session.childProcess.kill('SIGTERM'); } catch (_) {}
+    }
+    docker.releaseMutex(sessionId);
+    setTimeout(() => sessions.destroySession(sessionId, { reason: 'finalize_error' }), 4000);
   }
 }
 
@@ -214,6 +220,12 @@ function handleFlowError(sessionId, session, reason) {
   if (reason === 'oauth_token_exchange_failed' || reason === 'agy_binary_missing') {
     sessions.updateStatus(sessionId, 'error');
     sessions.emitSSE(sessionId, { type: 'error', message });
+    docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath).catch(() => {});
+    if (session.childProcess) {
+      try { session.childProcess.kill('SIGTERM'); } catch (_) {}
+    }
+    docker.releaseMutex(sessionId);
+    setTimeout(() => sessions.destroySession(sessionId, { reason: 'flow_error' }), 4000);
   } else {
     sessions.updateStatus(sessionId, 'eligibility_error', { reason });
     sessions.emitSSE(sessionId, {
@@ -223,6 +235,14 @@ function handleFlowError(sessionId, session, reason) {
       message,
       retryable: reason !== 'eligibility_location_unsupported' && reason !== 'credential_missing_or_expired',
     });
+    if (reason === 'eligibility_location_unsupported' || reason === 'credential_missing_or_expired') {
+      docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath).catch(() => {});
+      if (session.childProcess) {
+        try { session.childProcess.kill('SIGTERM'); } catch (_) {}
+      }
+      docker.releaseMutex(sessionId);
+      setTimeout(() => sessions.destroySession(sessionId, { reason: 'flow_error' }), 4000);
+    }
   }
   emitAuthLog(sessionId, 'error', message);
 }
@@ -336,6 +356,8 @@ function attachAgyProcess(sessionId, child, kind) {
             outcome: 'unknown',
             message: `AGY process ended (code=${code}) before a conclusive eligibility result.`,
           });
+          docker.cleanupFifo(docker.CONFIG.containerName, s.fifoPath).catch(() => {});
+          docker.releaseMutex(sessionId);
         }
       }, 500);
     }

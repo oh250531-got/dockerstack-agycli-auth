@@ -388,6 +388,14 @@ function connectSSE(sessionId) {
   };
 }
 
+function closeSSE() {
+  if (state.sse) {
+    state.sse.close();
+    state.sse = null;
+    state.reconnects = 0;
+  }
+}
+
 function handleSSE(data) {
   console.log("[SSE]", data.type, data);
 
@@ -406,6 +414,7 @@ function handleSSE(data) {
       break;
     case "token_saved":
       onTokenSaved(data);
+      closeSSE();
       break;
     case "auth_log":
       appendLoginLog(data);
@@ -415,9 +424,11 @@ function handleSSE(data) {
       break;
     case "error":
       showError(data.message || "Unknown error");
+      closeSSE();
       break;
     case "closed":
       toast("Session closed: " + (data.reason || ""), "info");
+      closeSSE();
       break;
   }
 }
