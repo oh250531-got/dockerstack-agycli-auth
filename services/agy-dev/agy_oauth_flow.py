@@ -5,6 +5,12 @@ This intentionally does NOT bypass AGY account eligibility. It drives the normal
 flow, captures the OAuth URL and, when AGY requires it, the official Google account
 verification URL printed by AGY.
 
+The eligibility check uses AGY's NON-INTERACTIVE print mode (`agy -p <prompt>`, the
+`--print` flag: "Run a single prompt non-interactively and print the response").
+This runs the model once and prints the plain-text response, which removes the fragile
+TUI screen matching ("? for shortcuts" etc.) that changed across AGY releases and used
+to leave the flow spinning forever after onboarding.
+
 Structured stdout markers consumed by the web app:
   __AGY_OAUTH_URL__=<url>
   __AGY_VERIFY_URL__=<url>
@@ -19,6 +25,7 @@ import pty
 import re
 import select
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -42,6 +49,17 @@ NETWORK_ERROR_PATTERNS = (
     "403 forbidden",
 )
 
+# Very specific failure strings that are essentially never printed by AGY in
+# benign output. Matched even without the "eligibility check failed" prefix so a
+# differently-worded backend/network failure is not misreported as flow_timeout.
+STRONG_NETWORK_PATTERNS = (
+    "connection reset by peer",
+    "tls: failed to verify certificate",
+    "x509:",
+    "no such host",
+    "temporary failure in name resolution",
+)
+
 INELIGIBLE_PATTERNS = (
     "your current account is not eligible for antigravity",
     "account ineligible",
@@ -52,6 +70,8 @@ LOCATION_PATTERNS = (
     "not currently available in your location",
     "user location is not supported for the api use",
 )
+
+DEFAULT_CREDENTIAL_PATH = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 
 
 def emit_marker(name: str, value: str) -> None:
@@ -92,6 +112,14 @@ def collect_urls(blob: bytes):
     return out
 
 
+def dump_tail(path: str, blob: bytes, limit: int = 16384) -> None:
+    try:
+        with open(path, "wb") as f:
+            f.write(blob[-limit:])
+    except OSError:
+        pass
+
+
 def read_code_file(path: str):
     if not path or not os.path.exists(path):
         return None
@@ -109,15 +137,69 @@ def read_code_file(path: str):
         return None
 
 
+def run_print_probe(agy: str, probe_token: str, probe_prompt: str,
+                    timeout_sec: int, verify_wait: int, mode: str):
+    """Run AGY in non-interactive print mode and classify the outcome.
+
+    Returns (status, error_reason): status in {"verified", "verification_required",
+    "error"}, error_reason set when status is "error".
+    """
+    print_timeout = max(60, int(verify_wait) + 30)
+    cmd = [agy, "-p", probe_prompt, "--print-timeout", f"{print_timeout}s"]
+    emit_marker("FLOW_STATUS", "eligibility_checking")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=print_timeout + 20,
+            stdin=subprocess.DEVNULL,
+            env=dict(os.environ, TERM="dumb"),
+        )
+    except subprocess.TimeoutExpired:
+        dump_tail(f"/tmp/agy-probe-{mode}-{os.getpid()}.txt", b"[probe timeout]")
+        return "error", "eligibility_inconclusive_no_probe_response"
+
+    out = proc.stdout + proc.stderr
+    dump_tail(f"/tmp/agy-probe-{mode}-{os.getpid()}.txt", out)
+    text = strip_ansi(out)
+    low = text.lower()
+
+    # Official verification URL (AGY requires Google account verification).
+    for m in URL_RE.finditer(out):
+        u = clean_url(m.group(0))
+        if VERIFY_HOST_PATH in u:
+            emit_marker("VERIFY_URL", u.decode("utf-8", "replace"))
+            return "verification_required", None
+
+    # Positive evidence: the model replied with our nonce on a response line
+    # (exclude the prompt itself, which contains the same nonce).
+    for line in text.splitlines():
+        if probe_token in line and "reply exactly" not in line.lower():
+            return "verified", None
+
+    if any(p in low for p in LOCATION_PATTERNS):
+        return "error", "eligibility_location_unsupported"
+    if any(p in low for p in INELIGIBLE_PATTERNS):
+        return "error", "eligibility_failed_without_verify_url"
+    if "authentication required" in low or "not signed in" in low or "select login method" in low:
+        return "error", "credential_missing_or_expired"
+    if any(p in low for p in STRONG_NETWORK_PATTERNS):
+        return "error", "eligibility_network_error"
+    if "forbidden" in low or "permission denied" in low or "failed to send request" in low:
+        return "error", "eligibility_network_error"
+    return "error", "eligibility_inconclusive_no_probe_response"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=("login", "eligibility"), default="login")
     ap.add_argument("--code-file", default=None)
     ap.add_argument("--timeout", type=int, default=420)
     ap.add_argument("--verify-wait", type=int, default=45,
-                    help="Seconds to wait after prompt submission before treating the account as verified.")
+                    help="Seconds to wait after the probe is submitted before classifying the account.")
     ap.add_argument("--agy-binary", default=None)
     ap.add_argument("--prompt", default="Reply with OK")
+    ap.add_argument("--credential-path", default=DEFAULT_CREDENTIAL_PATH)
     args = ap.parse_args()
 
     # A successful interactive model response is our positive evidence that the
@@ -131,6 +213,22 @@ def main():
         emit_marker("FLOW_ERROR", "agy_binary_missing")
         return 127
 
+    # ─── Eligibility mode: no PTY, use agy's non-interactive print mode ────────
+    if args.mode == "eligibility":
+        if not os.path.exists(args.credential_path):
+            emit_marker("FLOW_ERROR", "credential_missing_or_expired")
+            return 2
+        final_status, final_error = run_print_probe(
+            agy, probe_token, probe_prompt, args.timeout, args.verify_wait, args.mode
+        )
+        if final_status == "verified":
+            return 0
+        if final_status == "verification_required":
+            return 10
+        emit_marker("FLOW_ERROR", final_error)
+        return 2
+
+    # ─── Login mode: PTY-driven OAuth to obtain the credential, then probe ─────
     cols, rows = 2000, 60
     deadline = time.time() + max(30, args.timeout)
 
@@ -148,6 +246,7 @@ def main():
 
     raw = bytearray()
     url_stream = bytearray()
+    raw_cap = 4 * 1024 * 1024  # 4 MiB — prevents unbounded memory growth
     seen_urls = []
     oauth_url = None
     verify_url = None
@@ -155,13 +254,10 @@ def main():
     login_needed = False
     code_prompt_seen = None
     code_sent = False
+    code_sent_at = None
     theme_done = False
     tos_done = False
     trust_done = False
-    chat_ready_at = None
-    prompt_sent = False
-    prompt_sent_at = None
-    prompt_raw_offset = None
     failure_seen_at = None
     final_status = None
     final_error = None
@@ -186,7 +282,10 @@ def main():
             raw += data
             url_stream += data
 
-            # Echo the raw PTY stream so the web app can retain diagnostics.
+            if len(raw) > raw_cap:
+                drop = len(raw) - raw_cap
+                del raw[:drop]
+
             try:
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
@@ -212,11 +311,7 @@ def main():
             if reply:
                 send(reply)
 
-            # Capture official URLs exactly as printed by AGY. Scan an
-            # incremental buffer rather than only the current read() chunk: PTY
-            # output can split a long URL across arbitrary reads. A regex match
-            # ending at the buffer boundary is held until a delimiter arrives,
-            # preventing a truncated URL from being emitted prematurely.
+            # Capture official URLs exactly as printed by AGY.
             scan_blob = bytes(url_stream)
             for m in URL_RE.finditer(scan_blob):
                 if m.end() == len(scan_blob):
@@ -243,18 +338,10 @@ def main():
 
         text = strip_ansi(bytes(raw))
         low = text.lower()
-
-        # In eligibility-only mode, a fresh login menu means persisted credentials
-        # are absent/expired. Never silently start a new OAuth flow here.
-        if args.mode == "eligibility" and (
-            "select login method" in low or "select a login method" in low
-        ):
-            final_error = "credential_missing_or_expired"
-            emit_marker("FLOW_ERROR", final_error)
-            break
+        credential_present = os.path.exists(args.credential_path)
 
         # Login mode: select Google OAuth only when AGY explicitly shows the menu.
-        if args.mode == "login" and not menu_done and (
+        if not menu_done and (
             "select login method" in low or "select a login method" in low
         ) and "google oauth" in low:
             login_needed = True
@@ -265,7 +352,7 @@ def main():
 
         # Feed auth code through the code file. With --code-file we NEVER fall
         # back to blocking stdin; the web backend can create the file later.
-        if args.mode == "login" and oauth_url and not code_sent and "authorization code" in low:
+        if oauth_url and not code_sent and "authorization code" in low:
             if code_prompt_seen is None:
                 code_prompt_seen = time.time()
                 emit_marker("FLOW_STATUS", "waiting_code")
@@ -274,13 +361,13 @@ def main():
                 if code:
                     send(code + b"\r")
                     code_sent = True
+                    code_sent_at = time.time()
                     emit_marker("FLOW_STATUS", "code_submitted")
 
-        active_after_auth = args.mode == "eligibility" or code_sent or not login_needed
-
-        # Onboarding screens. The exact TUI can change between AGY releases; keep
-        # pattern matching conservative and send only the minimum expected keys.
-        if active_after_auth and not theme_done and (
+        # Onboarding screens. We only need the credential; once it exists we
+        # abandon this TUI session and run the non-interactive eligibility probe,
+        # so auto-answer these screens conservatively while we wait.
+        if code_sent and not theme_done and (
             "choose your color scheme" in low or "color scheme" in low
         ):
             time.sleep(0.35)
@@ -288,7 +375,7 @@ def main():
             theme_done = True
             emit_marker("FLOW_STATUS", "onboarding_theme_done")
 
-        if active_after_auth and not tos_done and "terms of service" in low:
+        if code_sent and not tos_done and "terms of service" in low:
             time.sleep(0.35)
             send(b" ")
             time.sleep(0.15)
@@ -300,21 +387,11 @@ def main():
             tos_done = True
             emit_marker("FLOW_STATUS", "onboarding_tos_done")
 
-        if active_after_auth and not trust_done and "do you trust the contents" in low:
+        if code_sent and not trust_done and "do you trust the contents" in low:
             time.sleep(0.30)
             send(b"\r")
             trust_done = True
             emit_marker("FLOW_STATUS", "onboarding_trust_done")
-
-        if not prompt_sent and "? for shortcuts" in low:
-            if chat_ready_at is None:
-                chat_ready_at = time.time()
-            if time.time() - chat_ready_at > 0.8:
-                send(b"\r")
-                prompt_sent = True
-                prompt_sent_at = time.time()
-                prompt_raw_offset = len(raw)
-                emit_marker("FLOW_STATUS", "eligibility_checking")
 
         # Hard OAuth/PKCE failures.
         if "invalid code verifier" in low or "token exchange failed" in low or "invalid_grant" in low:
@@ -328,55 +405,42 @@ def main():
             emit_marker("FLOW_ERROR", final_error)
             break
 
-        # Network/backend failures should not be misreported as "needs verify".
-        if "eligibility check failed" in low and any(p in low for p in NETWORK_ERROR_PATTERNS):
-            final_error = "eligibility_network_error"
+        # The credential is the goal of the login phase. Once it exists (and any
+        # immediate onboarding screens have been handled), stop the PTY session
+        # and run the eligibility probe in non-interactive print mode.
+        if code_sent and credential_present:
+            if trust_done or (code_sent_at is not None and time.time() - code_sent_at > 10):
+                break
+
+        # Code exchange finished without producing a credential.
+        if code_sent and not credential_present and code_sent_at is not None \
+                and time.time() - code_sent_at > 60:
+            final_error = "credential_missing_or_expired"
             emit_marker("FLOW_ERROR", final_error)
             break
 
-        if "eligibility check failed" in low or any(p in low for p in INELIGIBLE_PATTERNS):
-            if failure_seen_at is None:
-                failure_seen_at = time.time()
-            # Give AGY time to print its official URL after the reason text.
-            if verify_url is None and time.time() - failure_seen_at > 8:
-                final_error = "eligibility_failed_without_verify_url"
-                emit_marker("FLOW_ERROR", final_error)
-                break
-
-        if verify_url is not None:
-            # Keep the PTY alive briefly so wrapped URL bytes / final diagnostics
-            # finish streaming, then return an explicit verification-required state.
-            time.sleep(1.0)
-            break
-
-        # Positive result: require an actual assistant response containing our
-        # nonce on a response-like line. The submitted user prompt itself contains
-        # the nonce too, so exclude lines that contain "Reply exactly". This is
-        # stronger evidence than merely waiting N seconds with no verify URL.
-        if prompt_sent and failure_seen_at is None and prompt_raw_offset is not None:
-            post_prompt = strip_ansi(bytes(raw[prompt_raw_offset:]))
-            response_seen = any(
-                probe_token in line and "reply exactly" not in line.lower()
-                for line in post_prompt.splitlines()
-            )
-            if response_seen:
-                final_status = "verified"
-                emit_marker("FLOW_STATUS", final_status)
-                break
-
-            if prompt_sent_at is not None and time.time() - prompt_sent_at >= max(10, args.verify_wait):
-                final_error = "eligibility_inconclusive_no_probe_response"
-                emit_marker("FLOW_ERROR", final_error)
-                break
-
     if time.time() >= deadline and final_status is None and final_error is None:
         final_error = "flow_timeout"
-        emit_marker("FLOW_ERROR", final_error)
 
     try:
         os.kill(pid, 15)
     except OSError:
         pass
+
+    # Abandon the TUI session and run the official eligibility probe.
+    if final_status is None and final_error is None:
+        time.sleep(1.0)
+        if os.path.exists(args.credential_path):
+            final_status, final_error = run_print_probe(
+                agy, probe_token, probe_prompt, args.timeout, args.verify_wait, args.mode
+            )
+        else:
+            final_error = final_error or "credential_missing_or_expired"
+
+    if final_status is None and final_error:
+        emit_marker("FLOW_ERROR", final_error)
+
+    dump_tail(f"/tmp/agy-screen-{args.mode}-{os.getpid()}.txt", strip_ansi(bytes(raw)).encode("utf-8", "replace"))
 
     if final_status == "verification_required":
         return 10

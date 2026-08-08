@@ -42,15 +42,21 @@ function emitAuthLog(sessionId, level, message, details = null) {
   sessions.appendLog(sessionId, { level, message, details });
 }
 
-function redactSecrets(text) {
-  return String(text || '')
+function redactSecrets(text, extraSecrets = []) {
+  let out = String(text || '');
+  for (const secret of extraSecrets) {
+    if (secret && secret.length >= 4) {
+      out = out.split(secret).join('[redacted-auth-code]');
+    }
+  }
+  return out
     .replace(/([A-Za-z0-9_-]{40,})/g, (m) => `${m.slice(0, 6)}…[${m.length} chars redacted]`)
     .replace(/([?&](?:code|token|access_token|refresh_token|client_secret|plt|state|code_challenge)=)[^&\s]+/gi, '$1[redacted]');
 }
 
 function buildAuthDiagnostics(session) {
-  const out = redactSecrets(session.stdoutBuf || '').trim();
-  const err = redactSecrets(session.stderrBuf || '').trim();
+  const out = redactSecrets(session.stdoutBuf || '', [session.authCode]).trim();
+  const err = redactSecrets(session.stderrBuf || '', [session.authCode]).trim();
   const tail = (s) => (s ? s.split(/\r?\n/).slice(-30).join('\n') : '(empty)');
   let hint = '';
   const combined = `${out}\n${err}`;
@@ -297,6 +303,12 @@ function attachAgyProcess(sessionId, child, kind) {
     return;
   }
 
+  // Generation counter: each new spawn (login → eligibility re-check) replaces
+  // the previous child. Close/error handlers of an OLD child must not mutate a
+  // session that now belongs to a NEWER child, otherwise killing the old driver
+  // in verify-check can briefly flip the UI to eligibility_unknown.
+  session.childGeneration = (session.childGeneration || 0) + 1;
+  const generation = session.childGeneration;
   session.childProcess = child;
   session.childKind = kind;
   child.stdout.on('data', (c) => handleAgyChunk(sessionId, session, c, false));
@@ -305,6 +317,7 @@ function attachAgyProcess(sessionId, child, kind) {
   child.on('close', (code) => {
     const current = sessions.getSession(sessionId);
     if (!current) return;
+    if (current.childGeneration !== generation) return;
     current.childExitCode = code;
     log.info(`agy ${kind} child closed for ${sessionId} (code=${code}, status=${current.status})`);
 
@@ -315,6 +328,7 @@ function attachAgyProcess(sessionId, child, kind) {
       setTimeout(() => {
         const s = sessions.getSession(sessionId);
         if (!s) return;
+        if (s.childGeneration !== generation) return;
         if (s.status === 'checking_eligibility' || s.status === 'checking_verification') {
           sessions.updateStatus(sessionId, 'eligibility_unknown');
           sessions.emitSSE(sessionId, {
@@ -331,6 +345,7 @@ function attachAgyProcess(sessionId, child, kind) {
     log.err(`agy ${kind} spawn error for ${sessionId}: ${err.message}`);
     const current = sessions.getSession(sessionId);
     if (!current) return;
+    if (current.childGeneration !== generation) return;
     sessions.updateStatus(sessionId, 'eligibility_error', { reason: 'spawn_error' });
     sessions.emitSSE(sessionId, {
       type: 'eligibility_result',
@@ -491,6 +506,7 @@ router.post('/submit-code', async (req, res) => {
   }
 
   sessions.updateStatus(sessionId, 'waiting_code');
+  session.authCode = code.trim();
   emitAuthLog(sessionId, 'info', 'Submitting authorization code into the same PTY/PKCE session.');
 
   try {
@@ -508,13 +524,18 @@ router.post('/submit-code', async (req, res) => {
   }
 
   sessions.updateStatus(sessionId, 'credential_wait');
-  const ok = await docker.waitForCredential(docker.CONFIG.containerName);
+  const ok = await docker.waitForCredential(docker.CONFIG.containerName, undefined, undefined, undefined, () => {
+    const s = sessions.getSession(sessionId);
+    return !!(s && (s.status === 'error' || s.eligibilityReason));
+  });
   if (!ok) {
-    sessions.emitSSE(sessionId, {
-      type: 'error',
-      message: 'Credential file did not appear in time. Code may be wrong/expired or PKCE session mismatched.',
-    });
-    return res.status(504).json({ error: 'Credential not detected (timeout).' });
+    const s = sessions.getSession(sessionId);
+    const driverReason = s ? s.eligibilityReason : null;
+    const message = driverReason
+      ? errorMessageForReason(driverReason)
+      : 'Credential file did not appear in time. Code may be wrong/expired or PKCE session mismatched.';
+    sessions.emitSSE(sessionId, { type: 'error', message });
+    return res.status(driverReason ? 409 : 504).json({ error: message });
   }
 
   session.credentialReady = true;

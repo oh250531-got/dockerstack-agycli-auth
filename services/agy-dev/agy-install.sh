@@ -32,15 +32,26 @@ if [ "${downloaded}" != "1" ]; then
 fi
 
 # 2. Chạy install.sh
-# install.sh có thể exit non-zero do warning PATH dù cài thành công
-# → dùng || true, verify binary bên dưới mới là nguồn sự thật
-bash /tmp/_agy-upstream-install.sh || true
+# install.sh có thể exit non-zero do warning PATH dù cài thành công, nên ta KHÔNG
+# hard-fail ngay ở bước này — nhưng cũng KHÔNG nuốt lỗi bằng `|| true`: ghi nhận
+# exit code để log cảnh báo rõ ràng. Nguồn sự thật là verify binary + version
+# (optional guard) bên dưới → install hỏng = fail build, không lặp lại bug
+# "silently-swallowed install failure" của 2.1.0.
+set +e
+bash /tmp/_agy-upstream-install.sh
+install_rc=$?
+set -e
 rm -f /tmp/_agy-upstream-install.sh
 
-# 3. Verify binary
+if [ "${install_rc}" -ne 0 ]; then
+  echo "==> [agy-install] WARNING: install.sh exited ${install_rc} (có thể do PATH warning). Sẽ verify binary/version bên dưới." >&2
+fi
+
+# 3. Verify binary + version — fail loudly nếu cài hỏng thật sự
 if ! command -v agy >/dev/null 2>&1; then
   echo "[agy-install] FAILED: install.sh chay xong nhung KHONG tim thay binary agy trong PATH." >&2
   echo "  PATH=${PATH}" >&2
+  echo "  install_rc=${install_rc}" >&2
   ls -la /usr/local/bin /root/.local/bin 2>/dev/null || true
   exit 1
 fi

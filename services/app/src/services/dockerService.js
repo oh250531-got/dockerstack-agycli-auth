@@ -751,9 +751,11 @@ async function waitForCredential(
   credentialPath = CONFIG.credentialPath,
   timeoutMs = CONFIG.credentialCheckTimeoutMs,
   intervalMs = CONFIG.credentialCheckIntervalMs,
+  isAborted = null,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (isAborted && isAborted()) return false;
     if (await _credentialExists(containerName, credentialPath)) return true;
     await new Promise((r) => setTimeout(r, intervalMs));
   }
