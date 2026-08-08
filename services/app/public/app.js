@@ -692,6 +692,15 @@ async function apiCheckVerification() {
       toast(message, "danger");
       return;
     }
+
+    if (json.needsRestart) {
+      toast("Verification requires re-authentication. Starting new login flow…", "info");
+      state.sse = null;
+      state.sessionId = null;
+      await apiStartLogin(state.email);
+      return;
+    }
+
     toast("Verification re-check started", "info");
   } catch (err) {
     dom.btnCheckVerification.disabled = false;

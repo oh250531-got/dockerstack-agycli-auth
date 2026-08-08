@@ -581,30 +581,17 @@ router.post('/verify-check', async (req, res) => {
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (session.status === 'success') return res.json({ success: true, stage: 'success' });
 
-  const credentialOk = session.credentialReady || await docker.waitForCredential(docker.CONFIG.containerName);
-  if (!credentialOk) {
-    return res.status(409).json({ error: 'Credential missing; please login again.' });
-  }
-  session.credentialReady = true;
-  session.eligibilityStatus = 'checking';
-  session.eligibilityReason = null;
+  emitAuthLog(sessionId, 'info', 'Verification requires re-authentication. Cleaning up current session to restart from scratch.');
 
   if (session.childProcess) {
     try { session.childProcess.kill('SIGTERM'); } catch (_) {}
   }
+  await docker.cleanupFifo(docker.CONFIG.containerName, session.fifoPath).catch(() => {});
+  await docker.resetCredential(docker.CONFIG.containerName).catch(() => {});
+  docker.releaseMutex(sessionId);
+  sessions.destroySession(sessionId, { reason: 'verify_restart' });
 
-  sessions.updateStatus(sessionId, 'checking_verification');
-  sessions.refreshSessionTimeout(sessionId, sessions.VERIFICATION_SESSION_TIMEOUT_MS);
-  sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'checking' });
-  emitAuthLog(sessionId, 'info', 'Re-checking AGY eligibility using the existing OAuth credential.');
-
-  const child = docker.spawnAgyEligibilityProbe({
-    containerName: docker.CONFIG.containerName,
-    sessionId,
-  });
-  attachAgyProcess(sessionId, child, 'eligibility');
-
-  return res.json({ success: true, stage: 'checking_verification' });
+  return res.json({ success: true, needsRestart: true });
 });
 
 // ─── POST /api/login/reset ────────────────────────────────────────────────────
