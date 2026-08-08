@@ -76,8 +76,6 @@ services:
       - "caddy_1.reverse_proxy.flush_interval=-1"
     networks: [app_net]
     depends_on:
-      litestream-restore:
-        condition: service_completed_successfully
       tinyauth:
         condition: service_healthy
       agy-dev:

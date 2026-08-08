@@ -247,6 +247,12 @@ if [ "${ENABLE_RCLONE:-false}" = "true" ]; then
   FILES+=( -f "$ROOT_DIR/docker-compose/compose.rclone-gate.yml" )
 fi
 
+# Khi litestream bật, nạp thêm gate override để app/tinyauth
+# depends_on litestream-restore (restore DB trước khi start).
+if [ "${ENABLE_LITESTREAM:-true}" = "true" ]; then
+  FILES+=( -f "$ROOT_DIR/docker-compose/compose.litestream-gate.yml" )
+fi
+
 # ── Debug info (set DC_VERBOSE=1 to show) ─────────────────────
 if [ "${DC_VERBOSE:-0}" = "1" ]; then
   echo "── dc.sh debug ──────────────────────────────────"

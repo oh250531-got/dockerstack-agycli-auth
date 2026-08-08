@@ -1,0 +1,21 @@
+# ================================================================
+#  compose.litestream-gate.yml — Litestream Restore Gate Override
+#
+#  File này CHỈ được dc.sh nạp khi ENABLE_LITESTREAM=true.
+#  Vai trò: thêm depends_on litestream-restore vào các service phải có
+#           data trước khi chạy (app, tinyauth).
+#
+#  Tách riêng để khi tắt litestream, file này không được merge → các
+#  service không cần phụ thuộc vào litestream-restore.
+# ================================================================
+
+services:
+  app:
+    depends_on:
+      litestream-restore:
+        condition: service_completed_successfully
+
+  tinyauth:
+    depends_on:
+      litestream-restore:
+        condition: service_completed_successfully

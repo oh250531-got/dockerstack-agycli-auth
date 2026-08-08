@@ -67,9 +67,6 @@ services:
       - "caddy.reverse_proxy={{upstreams ${TINYAUTH_PORT:-3000}}}"
       - "caddy.reverse_proxy.header_up=X-Forwarded-Proto https"
     networks: [app_net]
-    depends_on:
-      litestream-restore:
-        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "tinyauth", "healthcheck"]
