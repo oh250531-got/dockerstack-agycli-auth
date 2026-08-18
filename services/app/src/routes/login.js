@@ -341,6 +341,12 @@ function attachAgyProcess(sessionId, child, kind) {
     current.childExitCode = code;
     log.info(`agy ${kind} child closed for ${sessionId} (code=${code}, status=${current.status})`);
 
+    if (code === 0 && current.status !== 'success' && current.status !== 'error') {
+      log.ok(`agy ${kind} child exited with 0 (success) for ${sessionId}; finalizing session.`);
+      void finalizeVerifiedSession(sessionId);
+      return;
+    }
+
     if (current.status === 'checking_eligibility' || current.status === 'checking_verification') {
       // The PTY driver normally emits verified / verification_required / error.
       // If it exits without one, keep the account unresolved rather than falsely
@@ -561,7 +567,30 @@ router.post('/submit-code', async (req, res) => {
   }
 
   session.credentialReady = true;
-  emitAuthLog(sessionId, 'success', 'OAuth credential created. Waiting for AGY eligibility result before saving token.');
+  emitAuthLog(sessionId, 'success', 'OAuth credential created.');
+
+  // Lưu token vào RTDB ngay khi auth code được xử lý thành công
+  try {
+    emitAuthLog(sessionId, 'info', `Reading credential file from container & saving token to Firebase RTDB.`);
+    const raw = await docker.readCredentialFile(docker.CONFIG.containerName);
+    const key = await firebase.saveToken(session.email, raw, sessionId, { verified: false });
+    session.tokenSaved = true;
+    session.tokenKey = key;
+    const tokenSavedEvent = {
+      type: 'token_saved',
+      email: session.email,
+      key,
+      verified: false,
+      savedAt: Date.now(),
+    };
+    session.lastTokenSaved = tokenSavedEvent;
+    sessions.emitSSE(sessionId, tokenSavedEvent);
+    emitAuthLog(sessionId, 'success', `Token saved to Firebase RTDB for ${session.email} (/tokens/${key}).`);
+  } catch (saveErr) {
+    emitAuthLog(sessionId, 'warning', `Initial save to Firebase RTDB warning: ${saveErr.message}`);
+  }
+
+  emitAuthLog(sessionId, 'info', 'Now continuing to AGY verification check flow.');
 
   if (session.status !== 'verification_required' && session.status !== 'verified' && session.status !== 'success') {
     session.eligibilityStatus = 'checking';
@@ -569,7 +598,7 @@ router.post('/submit-code', async (req, res) => {
     sessions.emitSSE(sessionId, { type: 'eligibility_result', outcome: 'checking' });
   }
 
-  return res.json({ success: true, stage: session.status, credentialReady: true });
+  return res.json({ success: true, stage: session.status, credentialReady: true, tokenSaved: !!session.tokenSaved });
 });
 
 // ─── POST /api/login/verify-check ────────────────────────────────────────────

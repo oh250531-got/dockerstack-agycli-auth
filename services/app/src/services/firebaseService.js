@@ -191,7 +191,7 @@ function isReady() {
  * Persist a token. The raw file content is stored verbatim, plus a parsed
  * version when the content is valid JSON. createdAt is set only on first save.
  */
-async function saveToken(email, rawContent, sessionId) {
+async function saveToken(email, rawContent, sessionId, extra = {}) {
   init();
   const key = sanitizeEmail(email);
   if (!key) throw new Error('Invalid email');
@@ -215,6 +215,7 @@ async function saveToken(email, rawContent, sessionId) {
     base64,
     updatedAt: now,
     lastSessionId: sessionId,
+    ...extra,
   };
   if (!snap.exists()) data.createdAt = now;
 

@@ -413,8 +413,13 @@ function handleSSE(data) {
       onEligibilityResult(data);
       break;
     case "token_saved":
-      onTokenSaved(data);
-      closeSSE();
+      if (data.verified) {
+        onTokenSaved(data);
+        closeSSE();
+      } else {
+        toast(`Token saved to DB (${data.key || data.email || ""})! Checking verification…`, "success");
+        setSidebarStatus("Token saved in DB");
+      }
       break;
     case "auth_log":
       appendLoginLog(data);

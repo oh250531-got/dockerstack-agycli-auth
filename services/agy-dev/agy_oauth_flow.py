@@ -175,6 +175,7 @@ def run_print_probe(agy: str, probe_token: str, probe_prompt: str,
     # (exclude the prompt itself, which contains the same nonce).
     for line in text.splitlines():
         if probe_token in line and "reply exactly" not in line.lower():
+            emit_marker("FLOW_STATUS", "verified")
             return "verified", None
 
     if any(p in low for p in LOCATION_PATTERNS):
@@ -222,6 +223,7 @@ def main():
             agy, probe_token, probe_prompt, args.timeout, args.verify_wait, args.mode
         )
         if final_status == "verified":
+            emit_marker("FLOW_STATUS", "verified")
             return 0
         if final_status == "verification_required":
             return 10
@@ -445,6 +447,7 @@ def main():
     if final_status == "verification_required":
         return 10
     if final_status == "verified":
+        emit_marker("FLOW_STATUS", "verified")
         return 0
     return 2
 
